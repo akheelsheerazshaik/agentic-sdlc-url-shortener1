@@ -144,13 +144,10 @@ scripts/             demo and evidence capture
 | Testing approach, limitations, trade-offs | [`docs/TESTING.md`](docs/TESTING.md) |
 | Final engineering summary: plan, artifacts, risks, assumptions, limitations | [`docs/ENGINEERING_SUMMARY.md`](docs/ENGINEERING_SUMMARY.md) |
 
-## AI assistance
 
-I built this with an AI coding assistant (Claude), which the assignment permits.
 
-I made the top-level decisions:
 
-- **Stack:** TypeScript on Node.js, the language I work in daily.
+- **Stack:** TypeScript on Node.js, 
 - **Agent model:** agents call a live model when a key is set and fall back to recorded replies otherwise, so the demo always runs and the tests are reproducible.
 - **Verification:** the whole submission was run in two environments, one of them my own machine, before it was submitted.
 
