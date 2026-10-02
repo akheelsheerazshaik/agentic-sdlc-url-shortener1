@@ -1,0 +1,677 @@
+===================================================================
+--- a/README.md
++++ b/README.md
+@@ -16,8 +16,12 @@
+ curl -s -X POST localhost:3000/api/v1/links \
+   -H 'content-type: application/json' \
+   -d '{"url": "https://example.com/landing", "alias": "spring-sale"}'
+ 
++curl -s -X POST localhost:3000/api/v1/links \
++  -H 'content-type: application/json' \
++  -d '{"url": "https://example.com/offer", "ttlSeconds": 3600}'   # expires in an hour
++
+ curl -i localhost:3000/spring-sale                      # 302 to the target
+ curl -s localhost:3000/api/v1/links/spring-sale/stats   # click analytics
+ ```
+ 
+@@ -26,12 +30,12 @@
+ The contract is in [`openapi.yaml`](openapi.yaml).
+ 
+ | Method | Path | Purpose |
+ | --- | --- | --- |
+-| `POST` | `/api/v1/links` | Create a link, optionally with a custom alias |
+-| `GET` | `/api/v1/links/{code}` | Read a link |
++| `POST` | `/api/v1/links` | Create a link, optionally with a custom alias and an expiry |
++| `GET` | `/api/v1/links/{code}` | Read a link, expired or not |
+ | `GET` | `/api/v1/links/{code}/stats` | Total clicks, clicks per day, top referrers |
+-| `GET` | `/{code}` | Redirect to the target (`302`, never cached) |
++| `GET` | `/{code}` | Redirect to the target (`302`, never cached); `410` once expired |
+ | `GET` | `/healthz`, `/readyz` | Liveness and readiness probes |
+ 
+ Errors are RFC 9457 problem documents (`application/problem+json`) with a stable `code` field.
+ 
+@@ -56,17 +60,19 @@
+ 
+ - **Layers.** `http/` handles requests, `links/` and `analytics/` hold the logic, `db/` owns SQLite. Only the repository and analytics classes contain SQL, and every statement is parameterized.
+ - **Codes.** Seven random base62 characters from a cryptographic source. Uniqueness is enforced by the primary key: insert, and retry on a clash.
+ - **Destination rules.** Only `http` and `https`, no embedded credentials, at most 2048 characters, and never a link back to this service.
++- **Expiry.** A link may be created with `expiresAt` (absolute, with a time zone) or `ttlSeconds` (relative), not both. From that instant the redirect returns `410 Gone` and records no click. Metadata and stats stay readable, and the alias stays reserved so an expired link cannot be taken over.
+ - **Redirects** use `302` with `Cache-Control: no-store`, so every click reaches the service and is counted.
+-- **Click recording** is decoupled from the redirect. A redirect pushes an event onto a bounded in-memory queue; a timer writes batches in one transaction together with the running totals.
++- **Click recording** is decoupled from the redirect. A redirect pushes an event onto a bounded in-memory queue; a timer writes batches in one transaction together with the running totals. On graceful shutdown the remaining events are written before the database closes.
+ - **Rate limiting** is a per-client token bucket on `/api/*`. Redirects are not limited.
+ - **Privacy.** Only the referrer's host is stored. Request logs contain the method and path, not the client address.
+ - **Migrations** are plain SQL files applied in order. An applied file may not change; the stored checksum is verified at startup.
+ 
+ ## Known limitations
+ 
+-- Clicks still buffered when the process stops are lost, and clicks are dropped when the queue is full. Analytics are best-effort by design.
++- Clicks are dropped when the queue is full, and clicks still buffered when the process is killed without a graceful shutdown (`SIGKILL`, crash, power loss) are lost. Analytics are best-effort by design.
++- Expired links are kept, not deleted, so their stats remain available.
+ - The API has no authentication: anyone who can reach it can create links and read stats.
+ - Rate limits and the click queue live in one process. Running several instances needs a shared store.
+ - SQLite is a single-writer, single-node database.
+ - `node:sqlite` prints an experimental-feature warning on current Node.js releases.
+
+===================================================================
+--- /dev/null
++++ b/migrations/002_link_expiry.sql
+@@ -0,0 +1,4 @@
++-- 002: optional link expiry.
++-- NULL means the link never expires, so every existing link keeps working unchanged.
++
++ALTER TABLE links ADD COLUMN expires_at TEXT;   -- ISO-8601, UTC
+
+===================================================================
+--- a/openapi.yaml
++++ b/openapi.yaml
+@@ -1,8 +1,8 @@
+ openapi: 3.1.0
+ info:
+   title: URL Shortener API
+-  version: 1.0.0
++  version: 1.1.0
+   description: Create short links, redirect to their targets, and read click analytics.
+ servers:
+   - url: http://localhost:3000
+ paths:
+@@ -43,8 +43,9 @@
+   /api/v1/links/{code}:
+     get:
+       operationId: getLink
+       summary: Get a link
++      description: Returns the link whether or not it has expired.
+       parameters:
+         - $ref: '#/components/parameters/Code'
+       responses:
+         '200':
+@@ -93,8 +94,14 @@
+                 type: string
+                 const: no-store
+         '404':
+           $ref: '#/components/responses/Problem'
++        '410':
++          description: The link has expired. No Location header is sent and no click is recorded.
++          content:
++            application/problem+json:
++              schema:
++                $ref: '#/components/schemas/Problem'
+   /healthz:
+     get:
+       operationId: liveness
+       summary: Liveness probe
+@@ -151,11 +158,22 @@
+         alias:
+           type: string
+           pattern: '^[a-z0-9][a-z0-9_-]{2,31}$'
+           description: Optional custom code. Lowercase only; some names are reserved.
++        expiresAt:
++          type: string
++          format: date-time
++          description: >-
++            Instant after which the link stops redirecting. Must include a time zone and be in the future.
++            Cannot be combined with ttlSeconds.
++        ttlSeconds:
++          type: integer
++          minimum: 1
++          maximum: 157680000
++          description: Lifetime in seconds from creation, up to five years. Cannot be combined with expiresAt.
+     Link:
+       type: object
+-      required: [code, shortUrl, targetUrl, createdAt]
++      required: [code, shortUrl, targetUrl, createdAt, expiresAt]
+       properties:
+         code:
+           type: string
+         shortUrl:
+@@ -166,8 +184,12 @@
+           format: uri
+         createdAt:
+           type: string
+           format: date-time
++        expiresAt:
++          type: [string, 'null']
++          format: date-time
++          description: Expiry instant in UTC, or null if the link never expires.
+     LinkStats:
+       type: object
+       required: [code, totalClicks, clicksByDay, topReferrers]
+       properties:
+
+===================================================================
+--- a/src/analytics/clickRecorder.ts
++++ b/src/analytics/clickRecorder.ts
+@@ -17,9 +17,9 @@
+  * Buffers click events in memory and writes them in batches.
+  *
+  * Redirects are the hot path and must not wait on an analytics write, so recording a click is an
+  * in-memory push. The cost is that analytics are best-effort: events can be dropped when the queue
+- * is full, and events still buffered when the process stops are lost.
++ * is full, and events still buffered when the process is killed without a graceful shutdown are lost.
+  */
+ export class ClickRecorder {
+   private readonly db: Database;
+   private readonly options: ClickRecorderOptions;
+@@ -85,13 +85,15 @@
+     // Do not keep the process alive just for the flush timer.
+     this.timer.unref();
+   }
+ 
+-  stop(): void {
++  /** Stops the timer and writes whatever is still buffered. Called on graceful shutdown. */
++  close(): number {
+     if (this.timer) {
+       clearInterval(this.timer);
+       this.timer = undefined;
+     }
++    return this.flush();
+   }
+ 
+   get pending(): number {
+     return this.queue.length;
+
+===================================================================
+--- a/src/app.ts
++++ b/src/app.ts
+@@ -71,10 +71,16 @@
+ 
+   registerRoutes(app, { db, links, stats, recorder, now });
+ 
+   recorder.start((error) => app.log.error({ err: error }, 'click flush failed'));
++  // Runs after in-flight requests finish and before the caller closes the database, so clicks
++  // accepted during shutdown are written rather than discarded.
+   app.addHook('onClose', async () => {
+-    recorder.stop();
++    try {
++      recorder.close();
++    } catch (error) {
++      app.log.error({ err: error, lost: recorder.pending }, 'final click flush failed');
++    }
+   });
+ 
+   return app;
+ }
+
+===================================================================
+--- a/src/domain/errors.ts
++++ b/src/domain/errors.ts
+@@ -21,8 +21,11 @@
+ 
+ export const linkNotFound = (code: string): AppError =>
+   new AppError(404, 'link_not_found', `No link exists for code "${code}".`);
+ 
++export const linkExpired = (code: string): AppError =>
++  new AppError(410, 'link_expired', `The link "${code}" has expired.`);
++
+ export const aliasTaken = (alias: string): AppError =>
+   new AppError(409, 'alias_taken', `The alias "${alias}" is already in use.`);
+ 
+ export const rateLimited = (retryAfterSeconds: number): AppError =>
+
+===================================================================
+--- a/src/http/routes.ts
++++ b/src/http/routes.ts
+@@ -4,9 +4,9 @@
+ import type { StatsService } from '../analytics/statsService.ts';
+ import type { Database } from '../db/database.ts';
+ import { linkNotFound, validationError } from '../domain/errors.ts';
+ import { CODE_PATTERN } from '../domain/shortCode.ts';
+-import type { LinkService } from '../links/linkService.ts';
++import { MAX_TTL_SECONDS, type LinkService } from '../links/linkService.ts';
+ 
+ export interface RouteDependencies {
+   db: Database;
+   links: LinkService;
+@@ -17,8 +17,10 @@
+ 
+ const createLinkBody = z.strictObject({
+   url: z.string().min(1),
+   alias: z.string().optional(),
++  expiresAt: z.iso.datetime({ offset: true }).optional(),
++  ttlSeconds: z.number().int().positive().max(MAX_TTL_SECONDS).optional(),
+ });
+ 
+ function parseBody<T>(schema: z.ZodType<T>, body: unknown): T {
+   const result = schema.safeParse(body);
+@@ -47,15 +49,10 @@
+     return reply.code(201).header('location', `/api/v1/links/${link.code}`).send(link);
+   });
+ 
+   app.get('/api/v1/links/:code', async (request) => {
+-    const record = links.get(codeParam(request.params));
+-    return {
+-      code: record.code,
+-      shortUrl: links.shortUrlFor(record.code),
+-      targetUrl: record.targetUrl,
+-      createdAt: record.createdAt,
+-    };
++    // Metadata stays readable after expiry; only the redirect stops.
++    return links.toLink(links.get(codeParam(request.params)));
+   });
+ 
+   app.get('/api/v1/links/:code/stats', async (request) => {
+     const code = codeParam(request.params);
+@@ -65,9 +62,9 @@
+   });
+ 
+   app.get('/:code', async (request, reply) => {
+     const code = codeParam(request.params);
+-    const record = links.get(code);
++    const record = links.resolve(code);
+     recorder.record({
+       code,
+       clickedAt: now().toISOString(),
+       referrerHost: referrerHost(request.headers.referer),
+
+===================================================================
+--- a/src/links/linkRepository.ts
++++ b/src/links/linkRepository.ts
+@@ -4,15 +4,20 @@
+ export interface LinkRecord {
+   code: string;
+   targetUrl: string;
+   createdAt: string;
++  /** ISO-8601 UTC instant after which the link no longer redirects, or null if it never expires. */
++  expiresAt: string | null;
+   clickCount: number;
+ }
+ 
++export type NewLink = Pick<LinkRecord, 'code' | 'targetUrl' | 'createdAt' | 'expiresAt'>;
++
+ interface LinkRow {
+   code: string;
+   target_url: string;
+   created_at: string;
++  expires_at: string | null;
+   click_count: number;
+ }
+ 
+ /** The only place that knows how links are stored. Every statement is parameterized. */
+@@ -21,18 +26,18 @@
+   private readonly findStatement: StatementSync;
+ 
+   constructor(db: Database) {
+     this.insertStatement = db.prepare(
+-      'INSERT INTO links (code, target_url, created_at) VALUES (?, ?, ?) ON CONFLICT (code) DO NOTHING',
++      'INSERT INTO links (code, target_url, created_at, expires_at) VALUES (?, ?, ?, ?) ON CONFLICT (code) DO NOTHING',
+     );
+     this.findStatement = db.prepare(
+-      'SELECT code, target_url, created_at, click_count FROM links WHERE code = ?',
++      'SELECT code, target_url, created_at, expires_at, click_count FROM links WHERE code = ?',
+     );
+   }
+ 
+   /** Inserts the link. Returns false if the code is already taken, so the caller decides what a clash means. */
+-  insert(link: { code: string; targetUrl: string; createdAt: string }): boolean {
+-    const result = this.insertStatement.run(link.code, link.targetUrl, link.createdAt);
++  insert(link: NewLink): boolean {
++    const result = this.insertStatement.run(link.code, link.targetUrl, link.createdAt, link.expiresAt);
+     return Number(result.changes) === 1;
+   }
+ 
+   findByCode(code: string): LinkRecord | undefined {
+@@ -41,8 +46,9 @@
+     return {
+       code: row.code,
+       targetUrl: row.target_url,
+       createdAt: row.created_at,
++      expiresAt: row.expires_at,
+       clickCount: row.click_count,
+     };
+   }
+ }
+
+===================================================================
+--- a/src/links/linkService.ts
++++ b/src/links/linkService.ts
+@@ -1,19 +1,33 @@
+-import { aliasTaken, codeSpaceExhausted, linkNotFound } from '../domain/errors.ts';
++import {
++  aliasTaken,
++  codeSpaceExhausted,
++  linkExpired,
++  linkNotFound,
++  validationError,
++} from '../domain/errors.ts';
+ import { generateCode, validateAlias } from '../domain/shortCode.ts';
+ import { normalizeTargetUrl } from '../domain/urlPolicy.ts';
+-import type { LinkRecord, LinkRepository } from './linkRepository.ts';
++import type { LinkRecord, LinkRepository, NewLink } from './linkRepository.ts';
+ 
++/** Longest lifetime a caller may ask for with `ttlSeconds`: five years. */
++export const MAX_TTL_SECONDS = 5 * 365 * 24 * 60 * 60;
++
+ export interface CreateLinkInput {
+   url: string;
+   alias?: string | undefined;
++  /** Absolute expiry instant. Mutually exclusive with `ttlSeconds`. */
++  expiresAt?: string | undefined;
++  /** Lifetime from now, in seconds. Mutually exclusive with `expiresAt`. */
++  ttlSeconds?: number | undefined;
+ }
+ 
+ export interface Link {
+   code: string;
+   shortUrl: string;
+   targetUrl: string;
+   createdAt: string;
++  expiresAt: string | null;
+ }
+ 
+ export interface LinkServiceOptions {
+   publicBaseUrl: string;
+@@ -40,40 +54,72 @@
+     this.maxCodeAttempts = options.maxCodeAttempts ?? 5;
+   }
+ 
+   create(input: CreateLinkInput): Link {
++    const now = this.now();
+     const targetUrl = normalizeTargetUrl(input.url, { selfHost: this.selfHost });
+-    const createdAt = this.now().toISOString();
++    const expiresAt = resolveExpiry(input, now);
++    const createdAt = now.toISOString();
+ 
+     if (input.alias !== undefined) {
+       const alias = validateAlias(input.alias);
+-      if (!this.repository.insert({ code: alias, targetUrl, createdAt })) {
+-        throw aliasTaken(alias);
+-      }
+-      return this.toLink({ code: alias, targetUrl, createdAt });
++      const link: NewLink = { code: alias, targetUrl, createdAt, expiresAt };
++      // An expired alias stays taken. Reusing it would let someone else take over a link people already trust.
++      if (!this.repository.insert(link)) throw aliasTaken(alias);
++      return this.toLink(link);
+     }
+ 
+     // The primary key is the uniqueness check: insert and retry on a clash, with no read-then-write race.
+     for (let attempt = 0; attempt < this.maxCodeAttempts; attempt++) {
+-      const code = this.generate();
+-      if (this.repository.insert({ code, targetUrl, createdAt })) {
+-        return this.toLink({ code, targetUrl, createdAt });
+-      }
++      const link: NewLink = { code: this.generate(), targetUrl, createdAt, expiresAt };
++      if (this.repository.insert(link)) return this.toLink(link);
+     }
+     throw codeSpaceExhausted();
+   }
+ 
+-  /** Returns the stored link or throws a 404 error. */
++  /** Returns the stored link, expired or not, or throws a 404 error. */
+   get(code: string): LinkRecord {
+     const record = this.repository.findByCode(code);
+     if (!record) throw linkNotFound(code);
+     return record;
+   }
+ 
+-  shortUrlFor(code: string): string {
+-    return `${this.publicBaseUrl}/${code}`;
++  /** Returns a link that may be redirected to: throws 404 if unknown and 410 if expired. */
++  resolve(code: string): LinkRecord {
++    const record = this.get(code);
++    if (isExpired(record, this.now())) throw linkExpired(code);
++    return record;
+   }
+ 
+-  private toLink(link: { code: string; targetUrl: string; createdAt: string }): Link {
+-    return { ...link, shortUrl: this.shortUrlFor(link.code) };
++  toLink(link: NewLink): Link {
++    return {
++      code: link.code,
++      shortUrl: `${this.publicBaseUrl}/${link.code}`,
++      targetUrl: link.targetUrl,
++      createdAt: link.createdAt,
++      expiresAt: link.expiresAt,
++    };
+   }
+ }
++
++/** A link is expired from its expiry instant onwards. */
++export function isExpired(link: Pick<LinkRecord, 'expiresAt'>, now: Date): boolean {
++  return link.expiresAt !== null && now.getTime() >= new Date(link.expiresAt).getTime();
++}
++
++function resolveExpiry(input: CreateLinkInput, now: Date): string | null {
++  if (input.expiresAt !== undefined && input.ttlSeconds !== undefined) {
++    throw validationError('provide either expiresAt or ttlSeconds, not both.');
++  }
++  if (input.ttlSeconds !== undefined) {
++    return new Date(now.getTime() + input.ttlSeconds * 1000).toISOString();
++  }
++  if (input.expiresAt !== undefined) {
++    const expiresAt = new Date(input.expiresAt);
++    if (expiresAt.getTime() <= now.getTime()) {
++      throw validationError('expiresAt must be in the future.');
++    }
++    // Stored in UTC whatever offset the caller used.
++    return expiresAt.toISOString();
++  }
++  return null;
++}
+
+===================================================================
+--- /dev/null
++++ b/test/integration/expiry.api.test.ts
+@@ -0,0 +1,121 @@
++import { afterEach, beforeEach, describe, expect, it } from 'vitest';
++import { createLink, createTestApp, type TestApp } from '../helpers.ts';
++
++const HOUR = 60 * 60 * 1000;
++
++describe('link expiry', () => {
++  let t: TestApp;
++  beforeEach(() => {
++    t = createTestApp();
++  });
++  afterEach(async () => {
++    await t.app.close();
++  });
++
++  const redirect = (code: string) => t.app.inject({ method: 'GET', url: `/${code}` });
++
++  describe('creating a link', () => {
++    it('never expires by default', async () => {
++      const { body } = await createLink(t.app, { url: 'https://example.com', alias: 'forever' });
++      expect(body.expiresAt).toBeNull();
++      t.clock.advance(10 * 365 * 24 * HOUR);
++      expect((await redirect('forever')).statusCode).toBe(302);
++    });
++
++    it('accepts an absolute expiry and stores it in UTC', async () => {
++      const { status, body } = await createLink(t.app, {
++        url: 'https://example.com',
++        expiresAt: '2026-03-01T15:00:00+02:00',
++      });
++      expect(status).toBe(201);
++      expect(body.expiresAt).toBe('2026-03-01T13:00:00.000Z');
++    });
++
++    it('accepts a time-to-live relative to now', async () => {
++      const { status, body } = await createLink(t.app, { url: 'https://example.com', ttlSeconds: 3600 });
++      expect(status).toBe(201);
++      expect(body.expiresAt).toBe('2026-03-01T13:00:00.000Z');
++    });
++
++    it.each([
++      ['an expiry in the past', { expiresAt: '2026-03-01T11:59:59Z' }],
++      ['an expiry equal to now', { expiresAt: '2026-03-01T12:00:00Z' }],
++      ['both expiresAt and ttlSeconds', { expiresAt: '2026-04-01T00:00:00Z', ttlSeconds: 60 }],
++      ['an expiry that is not a timestamp', { expiresAt: 'next tuesday' }],
++      ['an expiry without a time zone', { expiresAt: '2026-04-01T00:00:00' }],
++      ['a zero ttl', { ttlSeconds: 0 }],
++      ['a negative ttl', { ttlSeconds: -5 }],
++      ['a fractional ttl', { ttlSeconds: 1.5 }],
++      ['a ttl beyond the maximum', { ttlSeconds: 6 * 365 * 24 * 60 * 60 }],
++    ])('rejects %s with 400', async (_label, fields) => {
++      const { status, body } = await createLink(t.app, { url: 'https://example.com', ...fields });
++      expect(status).toBe(400);
++      expect(body.code).toBe('validation_error');
++    });
++  });
++
++  describe('redirecting', () => {
++    beforeEach(async () => {
++      await createLink(t.app, { url: 'https://example.com/offer', alias: 'flash-sale', ttlSeconds: 3600 });
++    });
++
++    it('redirects until the expiry instant', async () => {
++      t.clock.advance(HOUR - 1);
++      const response = await redirect('flash-sale');
++      expect(response.statusCode).toBe(302);
++      expect(response.headers.location).toBe('https://example.com/offer');
++    });
++
++    it('returns 410 Gone from the expiry instant onwards, with no Location header', async () => {
++      t.clock.advance(HOUR);
++      const response = await redirect('flash-sale');
++      expect(response.statusCode).toBe(410);
++      expect(response.headers.location).toBeUndefined();
++      expect(response.headers['content-type']).toContain('application/problem+json');
++      expect(response.json()).toMatchObject({ status: 410, code: 'link_expired' });
++    });
++
++    it('does not count requests to an expired link as clicks', async () => {
++      await redirect('flash-sale');
++      t.clock.advance(2 * HOUR);
++      await redirect('flash-sale');
++      await redirect('flash-sale');
++      const stats = (await t.app.inject({ method: 'GET', url: '/api/v1/links/flash-sale/stats' })).json();
++      expect(stats.totalClicks).toBe(1);
++    });
++  });
++
++  describe('after expiry', () => {
++    beforeEach(async () => {
++      await createLink(t.app, { url: 'https://example.com/offer', alias: 'flash-sale', ttlSeconds: 3600 });
++      await redirect('flash-sale');
++      t.clock.advance(2 * HOUR);
++    });
++
++    it('still returns the link metadata and its stats', async () => {
++      const link = await t.app.inject({ method: 'GET', url: '/api/v1/links/flash-sale' });
++      expect(link.statusCode).toBe(200);
++      expect(link.json().expiresAt).toBe('2026-03-01T13:00:00.000Z');
++
++      const stats = await t.app.inject({ method: 'GET', url: '/api/v1/links/flash-sale/stats' });
++      expect(stats.statusCode).toBe(200);
++      expect(stats.json().totalClicks).toBe(1);
++    });
++
++    it('keeps the alias reserved, so an expired link cannot be taken over', async () => {
++      const { status, body } = await createLink(t.app, { url: 'https://attacker.example', alias: 'flash-sale' });
++      expect(status).toBe(409);
++      expect(body.code).toBe('alias_taken');
++    });
++  });
++
++  it('leaves links created before the expiry migration working', async () => {
++    t.db
++      .prepare("INSERT INTO links (code, target_url, created_at) VALUES ('legacy1', 'https://example.com/old', '2025-01-01T00:00:00.000Z')")
++      .run();
++    const response = await redirect('legacy1');
++    expect(response.statusCode).toBe(302);
++    const link = (await t.app.inject({ method: 'GET', url: '/api/v1/links/legacy1' })).json();
++    expect(link.expiresAt).toBeNull();
++  });
++});
+
+===================================================================
+--- a/test/integration/links.api.test.ts
++++ b/test/integration/links.api.test.ts
+@@ -24,8 +24,9 @@
+         code: body.code,
+         shortUrl: `https://sho.rt/${body.code}`,
+         targetUrl: 'https://example.com/landing?utm=1',
+         createdAt: '2026-03-01T12:00:00.000Z',
++        expiresAt: null,
+       });
+       expect(response.headers.location).toBe(`/api/v1/links/${body.code}`);
+     });
+ 
+
+===================================================================
+--- /dev/null
++++ b/test/integration/shutdown.test.ts
+@@ -0,0 +1,37 @@
++import { describe, expect, it } from 'vitest';
++import { createLink, createTestApp } from '../helpers.ts';
++
++/** Regression tests for clicks being lost when the service stops (BUG-17). */
++describe('graceful shutdown', () => {
++  it('writes buffered clicks before the app closes', async () => {
++    // A flush interval far longer than the test, so only the shutdown path can write the clicks.
++    const t = createTestApp({ env: { CLICK_FLUSH_INTERVAL_MS: '600000' } });
++    await createLink(t.app, { url: 'https://example.com', alias: 'deploy-day' });
++    for (let i = 0; i < 3; i++) {
++      await t.app.inject({ method: 'GET', url: '/deploy-day', headers: { referer: 'https://news.example/a' } });
++    }
++
++    const before = t.db.prepare("SELECT click_count FROM links WHERE code = 'deploy-day'").get();
++    expect(before).toEqual({ click_count: 0 });
++
++    await t.app.close();
++
++    const after = t.db.prepare("SELECT click_count FROM links WHERE code = 'deploy-day'").get();
++    expect(after).toEqual({ click_count: 3 });
++    const events = t.db.prepare('SELECT COUNT(*) AS n FROM click_events').get();
++    expect(events).toEqual({ n: 3 });
++  });
++
++  it('closes cleanly when there is nothing to flush', async () => {
++    const t = createTestApp();
++    await expect(t.app.close()).resolves.toBeUndefined();
++  });
++
++  it('still closes when the final flush fails', async () => {
++    const t = createTestApp({ env: { CLICK_FLUSH_INTERVAL_MS: '600000' } });
++    await createLink(t.app, { url: 'https://example.com', alias: 'doomed' });
++    await t.app.inject({ method: 'GET', url: '/doomed' });
++    t.db.close();
++    await expect(t.app.close()).resolves.toBeUndefined();
++  });
++});
+
+===================================================================
+--- a/test/unit/clickRecorder.test.ts
++++ b/test/unit/clickRecorder.test.ts
+@@ -48,8 +48,17 @@
+     recorder.flush();
+     expect(count()).toBe(2);
+   });
+ 
++  it('flushes what is buffered when closed', () => {
++    const { recorder, click, count } = setup();
++    click();
++    click();
++    expect(recorder.close()).toBe(2);
++    expect(count()).toBe(2);
++    expect(recorder.pending).toBe(0);
++  });
++
+   it('keeps the batch and leaves the database untouched when a flush fails', () => {
+     const { recorder, click, count, events } = setup();
+     click();
+     // A click for a code with no link violates the foreign key, so the whole batch must roll back.
+
+===================================================================
+--- /dev/null
++++ b/test/unit/linkExpiry.test.ts
+@@ -0,0 +1,19 @@
++import { describe, expect, it } from 'vitest';
++import { isExpired } from '../../src/links/linkService.ts';
++
++describe('isExpired', () => {
++  const expiresAt = '2026-03-01T13:00:00.000Z';
++
++  it('is false for a link without an expiry', () => {
++    expect(isExpired({ expiresAt: null }, new Date('2099-01-01T00:00:00Z'))).toBe(false);
++  });
++
++  it('is false one millisecond before the expiry instant', () => {
++    expect(isExpired({ expiresAt }, new Date('2026-03-01T12:59:59.999Z'))).toBe(false);
++  });
++
++  it('is true at the expiry instant and afterwards', () => {
++    expect(isExpired({ expiresAt }, new Date('2026-03-01T13:00:00.000Z'))).toBe(true);
++    expect(isExpired({ expiresAt }, new Date('2026-03-01T13:00:00.001Z'))).toBe(true);
++  });
++});

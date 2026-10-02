@@ -1,0 +1,128 @@
+{
+  "summary": "The two asks land in different parts of the codebase and meet in two files. Destination safety belongs with the existing URL rules in the domain layer and must also be applied where a link is resolved for a redirect. Device analytics follows the existing click path: derive a value from a request header at the route, carry it through the click recorder, store it with the click event, and aggregate it in the statistics service. Both touch the redirect route and the application wiring.",
+  "impactedModules": [
+    {
+      "path": "src/domain/urlPolicy.ts",
+      "change": "modify",
+      "reason": "Add the internal-destination and denylist rules to URL validation, and expose them for reuse at redirect time."
+    },
+    {
+      "path": "src/links/linkService.ts",
+      "change": "modify",
+      "reason": "Pass the denylist into validation on create; re-check the stored destination in resolve so existing links are covered."
+    },
+    {
+      "path": "src/domain/errors.ts",
+      "change": "extend",
+      "reason": "New link_blocked error mapped to 410."
+    },
+    {
+      "path": "src/config.ts",
+      "change": "extend",
+      "reason": "New DENIED_HOSTS setting, validated at startup."
+    },
+    {
+      "path": "src/app.ts",
+      "change": "modify",
+      "reason": "Wire the denylist from configuration into the link service."
+    },
+    {
+      "path": "src/http/routes.ts",
+      "change": "modify",
+      "reason": "Classify the device from the User-Agent header on redirect and pass the class to the recorder."
+    },
+    {
+      "path": "src/analytics/clickRecorder.ts",
+      "change": "modify",
+      "reason": "Carry and store the device class with each click event."
+    },
+    {
+      "path": "src/analytics/statsService.ts",
+      "change": "modify",
+      "reason": "Aggregate clicks by device class."
+    },
+    {
+      "path": "test/unit/urlPolicy.test.ts",
+      "change": "modify",
+      "reason": "The policy options gain a required field, and the new rules need coverage."
+    },
+    {
+      "path": "test/unit/clickRecorder.test.ts",
+      "change": "modify",
+      "reason": "Click events gain a required field."
+    },
+    {
+      "path": "test/integration/stats.api.test.ts",
+      "change": "modify",
+      "reason": "An existing assertion compares the whole stats body and must expect the added fields; device breakdown needs coverage."
+    },
+    {
+      "path": "openapi.yaml",
+      "change": "modify",
+      "reason": "New stats fields, new 410 reason, new destination restrictions."
+    },
+    {
+      "path": "README.md",
+      "change": "modify",
+      "reason": "Document the destination rules, the setting, the device breakdown and the privacy position."
+    }
+  ],
+  "newModules": [
+    {
+      "path": "src/domain/hostRules.ts",
+      "purpose": "Decide whether a host is internal or denied; parse the denylist setting."
+    },
+    {
+      "path": "src/analytics/deviceClass.ts",
+      "purpose": "Reduce a User-Agent header to a coarse device class."
+    },
+    {
+      "path": "migrations/003_click_device_class.sql",
+      "purpose": "Add device_class to click_events."
+    },
+    {
+      "path": "test/unit/hostRules.test.ts",
+      "purpose": "Tests for the internal-host and denylist rules, including unusual address notations."
+    },
+    {
+      "path": "test/unit/deviceClass.test.ts",
+      "purpose": "Tests for device classification."
+    },
+    {
+      "path": "test/integration/safety.api.test.ts",
+      "purpose": "API tests for destination safety on create and on redirect."
+    }
+  ],
+  "apiImpact": [
+    {
+      "operation": "POST /api/v1/links",
+      "change": "Stricter validation: internal and denied destinations are now rejected with 400. A destination that was accepted before can be refused now."
+    },
+    {
+      "operation": "GET /{code}",
+      "change": "Additive: 410 with code link_blocked when the stored destination is no longer allowed."
+    },
+    {
+      "operation": "GET /api/v1/links/{code}/stats",
+      "change": "Additive: device breakdown fields in the response."
+    }
+  ],
+  "dataImpact": [
+    "click_events gains device_class, not null, default 'unknown', restricted to five values. Existing rows take the default."
+  ],
+  "dataFlows": [
+    {
+      "flow": "Create link",
+      "change": "validate URL → internal-host check → denylist check → store."
+    },
+    {
+      "flow": "Redirect",
+      "change": "look up link → check expiry → re-check destination against the current rules → classify device from User-Agent → queue click with the class → 302. The header itself goes no further than the classifier."
+    },
+    {
+      "flow": "Statistics",
+      "change": "the per-device counts are read from click_events alongside the existing aggregates."
+    }
+  ],
+  "regressionSurface": []
+}

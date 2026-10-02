@@ -1,0 +1,29 @@
+{
+  "name": "sdlc-orchestrator",
+  "version": "1.0.0",
+  "description": "Agentic SDLC orchestrator: turns a requirement into a reviewed, verified change under governance",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.18"
+  },
+  "bin": {
+    "sdlc": "src/cli.ts"
+  },
+  "scripts": {
+    "sdlc": "node src/cli.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:e2e": "vitest run --config vitest.e2e.config.ts",
+    "verify": "npm run typecheck && npm test"
+  },
+  "dependencies": {
+    "diff": "^9.0.0",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@types/node": "^22.18.0",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.3"
+  }
+}

@@ -1,0 +1,34 @@
+{
+  "summary": "Expiry adds one nullable column and touches the link path end to end: repository, service, routes and the error catalogue. The lost-click defect is in the analytics path: the click recorder's buffer is only written by its timer, and the application's close hook stops the timer without writing what is left. The two changes do not overlap in any module.",
+  "impactedModules": [
+    { "path": "src/links/linkRepository.ts", "change": "modify", "reason": "Persist and read the new expires_at column." },
+    { "path": "src/links/linkService.ts", "change": "modify", "reason": "Validate the expiry input, and refuse to resolve an expired link for a redirect." },
+    { "path": "src/domain/errors.ts", "change": "extend", "reason": "New link_expired error mapped to 410." },
+    { "path": "src/http/routes.ts", "change": "modify", "reason": "Accept expiresAt and ttlSeconds, return expiresAt, and resolve through the expiry check on redirect." },
+    { "path": "src/analytics/clickRecorder.ts", "change": "modify", "reason": "BUG-17: stopping the recorder must flush the buffer." },
+    { "path": "src/app.ts", "change": "modify", "reason": "BUG-17: the close hook must call the flushing close and must not fail shutdown if it throws." },
+    { "path": "test/integration/links.api.test.ts", "change": "modify", "reason": "An existing assertion compares the whole response body and must expect the added field." },
+    { "path": "test/unit/clickRecorder.test.ts", "change": "extend", "reason": "Cover the flush on close." },
+    { "path": "openapi.yaml", "change": "modify", "reason": "New request fields, new response field, new 410 response." },
+    { "path": "README.md", "change": "modify", "reason": "Document expiry and the corrected shutdown behaviour." }
+  ],
+  "newModules": [
+    { "path": "migrations/002_link_expiry.sql", "purpose": "Add the nullable expires_at column to links." },
+    { "path": "test/integration/expiry.api.test.ts", "purpose": "API tests for creating, redirecting and reading links with an expiry." },
+    { "path": "test/unit/linkExpiry.test.ts", "purpose": "Boundary tests for the expiry check." },
+    { "path": "test/integration/shutdown.test.ts", "purpose": "Regression tests for BUG-17." }
+  ],
+  "apiImpact": [
+    { "operation": "POST /api/v1/links", "change": "Additive: optional expiresAt and ttlSeconds in the request, expiresAt in the response." },
+    { "operation": "GET /api/v1/links/{code}", "change": "Additive: expiresAt in the response." },
+    { "operation": "GET /{code}", "change": "Additive: 410 for an expired link." }
+  ],
+  "dataImpact": [
+    "links gains a nullable expires_at column. Existing rows read as NULL, meaning no expiry."
+  ],
+  "dataFlows": [
+    { "flow": "Redirect", "change": "look up link → check expiry → queue click → 302. An expired link stops at the check: 410, no click queued." },
+    { "flow": "Shutdown", "change": "app.close → onClose hook → recorder flushes its buffer → caller closes the database. Previously the hook only stopped the timer." }
+  ],
+  "regressionSurface": []
+}

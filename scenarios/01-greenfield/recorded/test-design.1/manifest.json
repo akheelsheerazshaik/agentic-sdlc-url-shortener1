@@ -1,0 +1,280 @@
+{
+  "summary": "Unit tests for the domain rules and components, and API tests that drive the whole application for every acceptance criterion.",
+  "changes": [
+    {
+      "path": "test/helpers.ts",
+      "action": "create",
+      "taskIds": [
+        "T-7",
+        "T-8"
+      ]
+    },
+    {
+      "path": "test/integration/links.api.test.ts",
+      "action": "create",
+      "taskIds": [
+        "T-8"
+      ]
+    },
+    {
+      "path": "test/integration/reliability.test.ts",
+      "action": "create",
+      "taskIds": [
+        "T-8"
+      ]
+    },
+    {
+      "path": "test/integration/stats.api.test.ts",
+      "action": "create",
+      "taskIds": [
+        "T-8"
+      ]
+    },
+    {
+      "path": "test/unit/clickRecorder.test.ts",
+      "action": "create",
+      "taskIds": [
+        "T-7"
+      ]
+    },
+    {
+      "path": "test/unit/migrator.test.ts",
+      "action": "create",
+      "taskIds": [
+        "T-7"
+      ]
+    },
+    {
+      "path": "test/unit/rateLimiter.test.ts",
+      "action": "create",
+      "taskIds": [
+        "T-7"
+      ]
+    },
+    {
+      "path": "test/unit/shortCode.test.ts",
+      "action": "create",
+      "taskIds": [
+        "T-7"
+      ]
+    },
+    {
+      "path": "test/unit/urlPolicy.test.ts",
+      "action": "create",
+      "taskIds": [
+        "T-7"
+      ]
+    }
+  ],
+  "coverage": [
+    {
+      "criterionId": "AC-1.1",
+      "tests": [
+        {
+          "file": "test/integration/links.api.test.ts",
+          "name": "creates a link with a generated code"
+        }
+      ]
+    },
+    {
+      "criterionId": "AC-1.2",
+      "tests": [
+        {
+          "file": "test/integration/links.api.test.ts",
+          "name": "creates a link with a custom alias"
+        },
+        {
+          "file": "test/integration/links.api.test.ts",
+          "name": "returns 409 when the alias is already taken"
+        }
+      ]
+    },
+    {
+      "criterionId": "AC-1.3",
+      "tests": [
+        {
+          "file": "test/integration/links.api.test.ts",
+          "name": "returns a 400 problem document for non-http scheme"
+        },
+        {
+          "file": "test/integration/links.api.test.ts",
+          "name": "returns a 400 problem document for reserved alias"
+        },
+        {
+          "file": "test/integration/links.api.test.ts",
+          "name": "returns a 400 problem document for unknown field"
+        },
+        {
+          "file": "test/unit/urlPolicy.test.ts",
+          "name": "rejects URLs longer than the limit"
+        }
+      ]
+    },
+    {
+      "criterionId": "AC-1.4",
+      "tests": [
+        {
+          "file": "test/integration/links.api.test.ts",
+          "name": "retries with a new code when a generated code collides"
+        },
+        {
+          "file": "test/integration/links.api.test.ts",
+          "name": "returns 503 instead of looping forever"
+        }
+      ]
+    },
+    {
+      "criterionId": "AC-2.1",
+      "tests": [
+        {
+          "file": "test/integration/links.api.test.ts",
+          "name": "redirects to the target with 302 and no caching"
+        }
+      ]
+    },
+    {
+      "criterionId": "AC-2.2",
+      "tests": [
+        {
+          "file": "test/integration/links.api.test.ts",
+          "name": "GET /:code returns 404 for an unknown code"
+        },
+        {
+          "file": "test/integration/links.api.test.ts",
+          "name": "returns 404 for the malformed code"
+        }
+      ]
+    },
+    {
+      "criterionId": "AC-3.1",
+      "tests": [
+        {
+          "file": "test/integration/links.api.test.ts",
+          "name": "GET /api/v1/links/:code returns the link"
+        },
+        {
+          "file": "test/integration/links.api.test.ts",
+          "name": "GET /api/v1/links/:code returns 404 for an unknown code"
+        }
+      ]
+    },
+    {
+      "criterionId": "AC-4.1",
+      "tests": [
+        {
+          "file": "test/integration/stats.api.test.ts",
+          "name": "counts every redirect"
+        },
+        {
+          "file": "test/integration/stats.api.test.ts",
+          "name": "does not count failed lookups"
+        }
+      ]
+    },
+    {
+      "criterionId": "AC-4.2",
+      "tests": [
+        {
+          "file": "test/integration/stats.api.test.ts",
+          "name": "groups clicks by UTC day, oldest first"
+        },
+        {
+          "file": "test/integration/stats.api.test.ts",
+          "name": "limits the daily breakdown to the reporting window"
+        }
+      ]
+    },
+    {
+      "criterionId": "AC-4.3",
+      "tests": [
+        {
+          "file": "test/integration/stats.api.test.ts",
+          "name": "ranks referrers by host"
+        },
+        {
+          "file": "test/integration/stats.api.test.ts",
+          "name": "stores only the referrer host, never the full URL"
+        }
+      ]
+    },
+    {
+      "criterionId": "AC-5.1",
+      "tests": [
+        {
+          "file": "test/integration/reliability.test.ts",
+          "name": "returns 429 with Retry-After once the burst is used up, then recovers"
+        }
+      ]
+    },
+    {
+      "criterionId": "AC-5.2",
+      "tests": [
+        {
+          "file": "test/integration/reliability.test.ts",
+          "name": "does not rate limit redirects"
+        }
+      ]
+    },
+    {
+      "criterionId": "AC-6.1",
+      "tests": [
+        {
+          "file": "test/integration/reliability.test.ts",
+          "name": "serves redirects even when the click queue is full"
+        },
+        {
+          "file": "test/unit/clickRecorder.test.ts",
+          "name": "drops clicks beyond the queue bound and counts them"
+        }
+      ]
+    },
+    {
+      "criterionId": "AC-6.2",
+      "tests": [
+        {
+          "file": "test/unit/clickRecorder.test.ts",
+          "name": "writes the events and the running total together on flush"
+        },
+        {
+          "file": "test/unit/clickRecorder.test.ts",
+          "name": "keeps the batch and leaves the database untouched when a flush fails"
+        }
+      ]
+    },
+    {
+      "criterionId": "AC-7.1",
+      "tests": [
+        {
+          "file": "test/integration/reliability.test.ts",
+          "name": "reports liveness and readiness"
+        },
+        {
+          "file": "test/integration/reliability.test.ts",
+          "name": "reports not ready when the database is unavailable"
+        }
+      ]
+    },
+    {
+      "criterionId": "AC-8.1",
+      "tests": [
+        {
+          "file": "test/integration/links.api.test.ts",
+          "name": "returns a 400 problem document for malformed JSON"
+        },
+        {
+          "file": "test/integration/links.api.test.ts",
+          "name": "rejects bodies over the size limit"
+        }
+      ]
+    },
+    {
+      "criterionId": "AC-8.2",
+      "tests": [
+        {
+          "file": "test/integration/reliability.test.ts",
+          "name": "returns a generic 500 and leaks no internals when the database fails"
+        }
+      ]
+    }
+  ]
+}

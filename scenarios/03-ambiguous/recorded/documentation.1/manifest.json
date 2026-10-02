@@ -1,0 +1,19 @@
+{
+  "summary": "README and OpenAPI contract updated for the destination rules, the denylist setting, the new statistics fields and the privacy position.",
+  "changes": [
+    {
+      "path": "README.md",
+      "action": "modify",
+      "taskIds": [
+        "T-9"
+      ]
+    },
+    {
+      "path": "openapi.yaml",
+      "action": "modify",
+      "taskIds": [
+        "T-9"
+      ]
+    }
+  ]
+}

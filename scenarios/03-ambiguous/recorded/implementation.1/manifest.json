@@ -1,0 +1,82 @@
+{
+  "summary": "Destination safety on create and on redirect, and device-class analytics with separate bot and non-bot totals.",
+  "changes": [
+    {
+      "path": "migrations/003_click_device_class.sql",
+      "action": "create",
+      "taskIds": [
+        "T-1"
+      ]
+    },
+    {
+      "path": "src/analytics/clickRecorder.ts",
+      "action": "modify",
+      "taskIds": [
+        "T-5"
+      ]
+    },
+    {
+      "path": "src/analytics/deviceClass.ts",
+      "action": "create",
+      "taskIds": [
+        "T-5"
+      ]
+    },
+    {
+      "path": "src/analytics/statsService.ts",
+      "action": "modify",
+      "taskIds": [
+        "T-6"
+      ]
+    },
+    {
+      "path": "src/app.ts",
+      "action": "modify",
+      "taskIds": [
+        "T-4"
+      ]
+    },
+    {
+      "path": "src/config.ts",
+      "action": "modify",
+      "taskIds": [
+        "T-3"
+      ]
+    },
+    {
+      "path": "src/domain/errors.ts",
+      "action": "modify",
+      "taskIds": [
+        "T-4"
+      ]
+    },
+    {
+      "path": "src/domain/hostRules.ts",
+      "action": "create",
+      "taskIds": [
+        "T-2"
+      ]
+    },
+    {
+      "path": "src/domain/urlPolicy.ts",
+      "action": "modify",
+      "taskIds": [
+        "T-2"
+      ]
+    },
+    {
+      "path": "src/http/routes.ts",
+      "action": "modify",
+      "taskIds": [
+        "T-5"
+      ]
+    },
+    {
+      "path": "src/links/linkService.ts",
+      "action": "modify",
+      "taskIds": [
+        "T-4"
+      ]
+    }
+  ]
+}

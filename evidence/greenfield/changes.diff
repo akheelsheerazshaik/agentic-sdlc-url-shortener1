@@ -1,0 +1,4278 @@
+===================================================================
+--- /dev/null
++++ b/.gitignore
+@@ -0,0 +1,5 @@
++node_modules/
++data/
++*.db
++*.db-shm
++*.db-wal
+
+===================================================================
+--- /dev/null
++++ b/README.md
+@@ -0,0 +1,73 @@
++# URL Shortener
++
++A small HTTP service that creates short links, redirects to their targets, and reports click analytics.
++
++## Run it
++
++Requires Node.js 22.18 or newer. There is no build step: Node runs the TypeScript sources directly.
++
++```bash
++npm install
++npm start            # http://localhost:3000
++npm run verify       # type-check and run all tests
++```
++
++```bash
++curl -s -X POST localhost:3000/api/v1/links \
++  -H 'content-type: application/json' \
++  -d '{"url": "https://example.com/landing", "alias": "spring-sale"}'
++
++curl -i localhost:3000/spring-sale                      # 302 to the target
++curl -s localhost:3000/api/v1/links/spring-sale/stats   # click analytics
++```
++
++## API
++
++The contract is in [`openapi.yaml`](openapi.yaml).
++
++| Method | Path | Purpose |
++| --- | --- | --- |
++| `POST` | `/api/v1/links` | Create a link, optionally with a custom alias |
++| `GET` | `/api/v1/links/{code}` | Read a link |
++| `GET` | `/api/v1/links/{code}/stats` | Total clicks, clicks per day, top referrers |
++| `GET` | `/{code}` | Redirect to the target (`302`, never cached) |
++| `GET` | `/healthz`, `/readyz` | Liveness and readiness probes |
++
++Errors are RFC 9457 problem documents (`application/problem+json`) with a stable `code` field.
++
++## Configuration
++
++| Variable | Default | Meaning |
++| --- | --- | --- |
++| `HOST` | `127.0.0.1` | Bind address |
++| `PORT` | `3000` | Listen port |
++| `PUBLIC_BASE_URL` | `http://localhost:3000` | Base of the short URLs returned to clients |
++| `DATABASE_PATH` | `./data/shortener.db` | SQLite file |
++| `TRUST_PROXY` | `false` | Set `true` only behind a trusted reverse proxy |
++| `RATE_LIMIT_CAPACITY` | `20` | Burst size per client for `/api/*` |
++| `RATE_LIMIT_REFILL_PER_SECOND` | `1` | Sustained requests per second per client |
++| `CLICK_FLUSH_INTERVAL_MS` | `1000` | How often buffered clicks are written |
++| `CLICK_QUEUE_MAX` | `10000` | Maximum buffered clicks |
++| `LOG_LEVEL` | `info` | `silent` to `trace` |
++
++Invalid configuration stops the process at startup.
++
++## Design notes
++
++- **Layers.** `http/` handles requests, `links/` and `analytics/` hold the logic, `db/` owns SQLite. Only the repository and analytics classes contain SQL, and every statement is parameterized.
++- **Codes.** Seven random base62 characters from a cryptographic source. Uniqueness is enforced by the primary key: insert, and retry on a clash.
++- **Destination rules.** Only `http` and `https`, no embedded credentials, at most 2048 characters, and never a link back to this service.
++- **Redirects** use `302` with `Cache-Control: no-store`, so every click reaches the service and is counted.
++- **Click recording** is decoupled from the redirect. A redirect pushes an event onto a bounded in-memory queue; a timer writes batches in one transaction together with the running totals.
++- **Rate limiting** is a per-client token bucket on `/api/*`. Redirects are not limited.
++- **Privacy.** Only the referrer's host is stored. Request logs contain the method and path, not the client address.
++- **Migrations** are plain SQL files applied in order. An applied file may not change; the stored checksum is verified at startup.
++
++## Known limitations
++
++- Clicks still buffered when the process stops are lost, and clicks are dropped when the queue is full. Analytics are best-effort by design.
++- The API has no authentication: anyone who can reach it can create links and read stats.
++- Rate limits and the click queue live in one process. Running several instances needs a shared store.
++- SQLite is a single-writer, single-node database.
++- `node:sqlite` prints an experimental-feature warning on current Node.js releases.
++- Click events are kept indefinitely.
+
+===================================================================
+--- /dev/null
++++ b/migrations/001_init.sql
+@@ -0,0 +1,18 @@
++-- 001: links and click events.
++-- Applied migrations are immutable: the migrator stores a checksum and refuses to start if a file changes.
++
++CREATE TABLE links (
++  code        TEXT    PRIMARY KEY,
++  target_url  TEXT    NOT NULL,
++  created_at  TEXT    NOT NULL,              -- ISO-8601, UTC
++  click_count INTEGER NOT NULL DEFAULT 0     -- running total, updated in the same transaction as click_events
++) STRICT, WITHOUT ROWID;
++
++CREATE TABLE click_events (
++  id            INTEGER PRIMARY KEY,
++  code          TEXT    NOT NULL REFERENCES links(code) ON DELETE CASCADE,
++  clicked_at    TEXT    NOT NULL,            -- ISO-8601, UTC
++  referrer_host TEXT                         -- host only; never the full referrer URL
++) STRICT;
++
++CREATE INDEX idx_click_events_code_time ON click_events (code, clicked_at);
+
+===================================================================
+--- /dev/null
++++ b/openapi.yaml
+@@ -0,0 +1,216 @@
++openapi: 3.1.0
++info:
++  title: URL Shortener API
++  version: 1.0.0
++  description: Create short links, redirect to their targets, and read click analytics.
++servers:
++  - url: http://localhost:3000
++paths:
++  /api/v1/links:
++    post:
++      operationId: createLink
++      summary: Create a short link
++      requestBody:
++        required: true
++        content:
++          application/json:
++            schema:
++              $ref: '#/components/schemas/CreateLinkRequest'
++      responses:
++        '201':
++          description: Link created.
++          headers:
++            Location:
++              description: Path of the created link resource.
++              schema:
++                type: string
++          content:
++            application/json:
++              schema:
++                $ref: '#/components/schemas/Link'
++        '400':
++          $ref: '#/components/responses/Problem'
++        '409':
++          description: The requested alias is already in use.
++          content:
++            application/problem+json:
++              schema:
++                $ref: '#/components/schemas/Problem'
++        '429':
++          $ref: '#/components/responses/RateLimited'
++        '503':
++          $ref: '#/components/responses/Problem'
++  /api/v1/links/{code}:
++    get:
++      operationId: getLink
++      summary: Get a link
++      parameters:
++        - $ref: '#/components/parameters/Code'
++      responses:
++        '200':
++          description: The link.
++          content:
++            application/json:
++              schema:
++                $ref: '#/components/schemas/Link'
++        '404':
++          $ref: '#/components/responses/Problem'
++        '429':
++          $ref: '#/components/responses/RateLimited'
++  /api/v1/links/{code}/stats:
++    get:
++      operationId: getLinkStats
++      summary: Get click analytics for a link
++      parameters:
++        - $ref: '#/components/parameters/Code'
++      responses:
++        '200':
++          description: Click analytics.
++          content:
++            application/json:
++              schema:
++                $ref: '#/components/schemas/LinkStats'
++        '404':
++          $ref: '#/components/responses/Problem'
++        '429':
++          $ref: '#/components/responses/RateLimited'
++  /{code}:
++    get:
++      operationId: redirect
++      summary: Redirect to the link's target
++      parameters:
++        - $ref: '#/components/parameters/Code'
++      responses:
++        '302':
++          description: Redirect to the target URL. Never cached, so every click is counted.
++          headers:
++            Location:
++              schema:
++                type: string
++                format: uri
++            Cache-Control:
++              schema:
++                type: string
++                const: no-store
++        '404':
++          $ref: '#/components/responses/Problem'
++  /healthz:
++    get:
++      operationId: liveness
++      summary: Liveness probe
++      responses:
++        '200':
++          description: The process is running.
++  /readyz:
++    get:
++      operationId: readiness
++      summary: Readiness probe
++      responses:
++        '200':
++          description: The service can reach its database.
++        '503':
++          description: The database is unavailable.
++components:
++  parameters:
++    Code:
++      name: code
++      in: path
++      required: true
++      schema:
++        type: string
++        pattern: '^[A-Za-z0-9_-]{3,32}$'
++  responses:
++    Problem:
++      description: Error, as an RFC 9457 problem document.
++      content:
++        application/problem+json:
++          schema:
++            $ref: '#/components/schemas/Problem'
++    RateLimited:
++      description: Too many requests from this client.
++      headers:
++        Retry-After:
++          description: Seconds to wait before retrying.
++          schema:
++            type: integer
++      content:
++        application/problem+json:
++          schema:
++            $ref: '#/components/schemas/Problem'
++  schemas:
++    CreateLinkRequest:
++      type: object
++      additionalProperties: false
++      required: [url]
++      properties:
++        url:
++          type: string
++          format: uri
++          maxLength: 2048
++          description: Absolute http or https URL, without embedded credentials.
++        alias:
++          type: string
++          pattern: '^[a-z0-9][a-z0-9_-]{2,31}$'
++          description: Optional custom code. Lowercase only; some names are reserved.
++    Link:
++      type: object
++      required: [code, shortUrl, targetUrl, createdAt]
++      properties:
++        code:
++          type: string
++        shortUrl:
++          type: string
++          format: uri
++        targetUrl:
++          type: string
++          format: uri
++        createdAt:
++          type: string
++          format: date-time
++    LinkStats:
++      type: object
++      required: [code, totalClicks, clicksByDay, topReferrers]
++      properties:
++        code:
++          type: string
++        totalClicks:
++          type: integer
++          minimum: 0
++        clicksByDay:
++          type: array
++          description: Clicks per UTC day over the last 30 days, oldest first. Days without clicks are omitted.
++          items:
++            type: object
++            required: [date, clicks]
++            properties:
++              date:
++                type: string
++                format: date
++              clicks:
++                type: integer
++        topReferrers:
++          type: array
++          description: Up to 10 referring hosts. Clicks without a referrer are reported as "direct".
++          items:
++            type: object
++            required: [referrer, clicks]
++            properties:
++              referrer:
++                type: string
++              clicks:
++                type: integer
++    Problem:
++      type: object
++      required: [type, title, status, code, detail]
++      properties:
++        type:
++          type: string
++        title:
++          type: string
++        status:
++          type: integer
++        code:
++          type: string
++          description: Stable machine-readable error code.
++        detail:
++          type: string
+
+===================================================================
+--- /dev/null
++++ b/package-lock.json
+@@ -0,0 +1,2162 @@
++{
++  "name": "url-shortener",
++  "version": "1.0.0",
++  "lockfileVersion": 3,
++  "requires": true,
++  "packages": {
++    "": {
++      "name": "url-shortener",
++      "version": "1.0.0",
++      "dependencies": {
++        "fastify": "^5.12.5",
++        "zod": "^4.6.5"
++      },
++      "devDependencies": {
++        "@types/node": "^22.18.0",
++        "typescript": "^7.0.2",
++        "vitest": "^5.0.3"
++      },
++      "engines": {
++        "node": ">=22.18"
++      }
++    },
++    "node_modules/@fastify/ajv-compiler": {
++      "version": "4.0.6",
++      "resolved": "https://registry.npmjs.org/@fastify/ajv-compiler/-/ajv-compiler-4.0.6.tgz",
++      "integrity": "sha512-NtuzM0SfaMJbGlnjr9LWQUN5LzgSrbB8tf/wRZNas+4E1O/Nmzl53e7ruT61HDZyRCJGC6FxIogmNZO1c5ETBA==",
++      "funding": [
++        {
++          "type": "github",
++          "url": "https://github.com/sponsors/fastify"
++        },
++        {
++          "type": "opencollective",
++          "url": "https://opencollective.com/fastify"
++        }
++      ],
++      "license": "MIT",
++      "dependencies": {
++        "ajv": "^8.12.0",
++        "ajv-formats": "^3.0.1",
++        "fast-uri": "^4.0.0"
++      }
++    },
++    "node_modules/@fastify/error": {
++      "version": "4.2.0",
++      "resolved": "https://registry.npmjs.org/@fastify/error/-/error-4.2.0.tgz",
++      "integrity": "sha512-RSo3sVDXfHskiBZKBPRgnQTtIqpi/7zhJOEmAxCiBcM7d0uwdGdxLlsCaLzGs8v8NnxIRlfG0N51p5yFaOentQ==",
++      "funding": [
++        {
++          "type": "github",
++          "url": "https://github.com/sponsors/fastify"
++        },
++        {
++          "type": "opencollective",
++          "url": "https://opencollective.com/fastify"
++        }
++      ],
++      "license": "MIT"
++    },
++    "node_modules/@fastify/fast-json-stringify-compiler": {
++      "version": "5.1.0",
++      "resolved": "https://registry.npmjs.org/@fastify/fast-json-stringify-compiler/-/fast-json-stringify-compiler-5.1.0.tgz",
++      "integrity": "sha512-PxcYtKLbQ8Z+yApiqjK8FwxIwvEj38k2OiLc17u8dkJSlmfi2wHHPaSnaoqBPQqtvF8YVsDgDpP2snDCfFrpfw==",
++      "funding": [
++        {
++          "type": "github",
++          "url": "https://github.com/sponsors/fastify"
++        },
++        {
++          "type": "opencollective",
++          "url": "https://opencollective.com/fastify"
++        }
++      ],
++      "license": "MIT",
++      "dependencies": {
++        "fast-json-stringify": "^7.0.0"
++      }
++    },
++    "node_modules/@fastify/forwarded": {
++      "version": "3.0.2",
++      "resolved": "https://registry.npmjs.org/@fastify/forwarded/-/forwarded-3.0.2.tgz",
++      "integrity": "sha512-NE8HgKLgYejV9lDpqkEFaDKMLYelJBVfHekhB0UKvX0ghagXRJqg68feg8er1NPXxG4N9i6vPxzt8E+3wHfcmA==",
++      "funding": [
++        {
++          "type": "github",
++          "url": "https://github.com/sponsors/fastify"
++        },
++        {
++          "type": "opencollective",
++          "url": "https://opencollective.com/fastify"
++        }
++      ],
++      "license": "MIT"
++    },
++    "node_modules/@fastify/merge-json-schemas": {
++      "version": "0.2.1",
++      "resolved": "https://registry.npmjs.org/@fastify/merge-json-schemas/-/merge-json-schemas-0.2.1.tgz",
++      "integrity": "sha512-OA3KGBCy6KtIvLf8DINC5880o5iBlDX4SxzLQS8HorJAbqluzLRn80UXU0bxZn7UOFhFgpRJDasfwn9nG4FG4A==",
++      "funding": [
++        {
++          "type": "github",
++          "url": "https://github.com/sponsors/fastify"
++        },
++        {
++          "type": "opencollective",
++          "url": "https://opencollective.com/fastify"
++        }
++      ],
++      "license": "MIT",
++      "dependencies": {
++        "dequal": "^2.0.3"
++      }
++    },
++    "node_modules/@fastify/proxy-addr": {
++      "version": "5.1.1",
++      "resolved": "https://registry.npmjs.org/@fastify/proxy-addr/-/proxy-addr-5.1.1.tgz",
++      "integrity": "sha512-zv07Y9GEuDsJPegZoDFd4SDWaZOW8N2pa0GSrYmKpId/tjt1Hgo3BjZBVjdVpfVrHaA+Qv5jawtS2O50J5xM9g==",
++      "funding": [
++        {
++          "type": "github",
++          "url": "https://github.com/sponsors/fastify"
++        },
++        {
++          "type": "opencollective",
++          "url": "https://opencollective.com/fastify"
++        }
++      ],
++      "license": "MIT",
++      "dependencies": {
++        "@fastify/forwarded": "^3.0.0",
++        "ipaddr.js": "^2.1.0"
++      }
++    },
++    "node_modules/@jridgewell/resolve-uri": {
++      "version": "3.1.2",
++      "resolved": "https://registry.npmjs.org/@jridgewell/resolve-uri/-/resolve-uri-3.1.2.tgz",
++      "integrity": "sha512-bRISgCIjP20/tbWSPWMEi54QVPRZExkuD9lJL+UIxUKtwVJA8wW1Trb1jMs1RFXo1CBTNZ/5hpC9QvmKWdopKw==",
++      "dev": true,
++      "license": "MIT",
++      "engines": {
++        "node": ">=6.0.0"
++      }
++    },
++    "node_modules/@jridgewell/sourcemap-codec": {
++      "version": "1.6.0",
++      "resolved": "https://registry.npmjs.org/@jridgewell/sourcemap-codec/-/sourcemap-codec-1.6.0.tgz",
++      "integrity": "sha512-T7jf+5zgsZHwNJ4lvQ7/aezbyk0nNX+zJVWpmHA7VYsEx7a7qr5Rg5IbtJFqkgze5Y2sruq1RUY8Q837Od7iFw==",
++      "dev": true,
++      "license": "MIT"
++    },
++    "node_modules/@jridgewell/trace-mapping": {
++      "version": "0.3.31",
++      "resolved": "https://registry.npmjs.org/@jridgewell/trace-mapping/-/trace-mapping-0.3.31.tgz",
++      "integrity": "sha512-zzNR+SdQSDJzc8joaeP8QQoCQr8NuYx2dIIytl1QeBEZHJ9uW6hebsrYgbz8hJwUQao3TWCMtmfV8Nu1twOLAw==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "@jridgewell/resolve-uri": "^3.1.0",
++        "@jridgewell/sourcemap-codec": "^1.4.14"
++      }
++    },
++    "node_modules/@oxc-project/types": {
++      "version": "0.152.0",
++      "resolved": "https://registry.npmjs.org/@oxc-project/types/-/types-0.152.0.tgz",
++      "integrity": "sha512-oM/5rLBm2tPkg0iBgkH/FOeR3PCDpY19GTgAZjMFM8h9WI9VW7cLgzp6nwtarYKmovavIQZ+Fe/RKX/8C8O/Rw==",
++      "dev": true,
++      "license": "MIT",
++      "peer": true,
++      "funding": {
++        "url": "https://github.com/sponsors/oxc-project"
++      }
++    },
++    "node_modules/@pinojs/redact": {
++      "version": "0.4.0",
++      "resolved": "https://registry.npmjs.org/@pinojs/redact/-/redact-0.4.0.tgz",
++      "integrity": "sha512-k2ENnmBugE/rzQfEcdWHcCY+/FM3VLzH9cYEsbdsoqrvzAKRhUZeRNhAZvB8OitQJ1TBed3yqWtdjzS6wJKBwg==",
++      "license": "MIT"
++    },
++    "node_modules/@rolldown/binding-android-arm-eabi": {
++      "version": "1.2.12",
++      "resolved": "https://registry.npmjs.org/@rolldown/binding-android-arm-eabi/-/binding-android-arm-eabi-1.2.12.tgz",
++      "integrity": "sha512-dB/a1214qKfHMXCpgqR4OZT+jS4kTyEXbQGJPqzobt5EwH5rX080pxE37alt3RzvR1bf1Yz/yGqRfrYAxuPw0A==",
++      "cpu": [
++        "arm"
++      ],
++      "dev": true,
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "android"
++      ],
++      "peer": true,
++      "engines": {
++        "node": "^20.19.0 || >=22.12.0"
++      }
++    },
++    "node_modules/@rolldown/binding-android-arm64": {
++      "version": "1.2.12",
++      "resolved": "https://registry.npmjs.org/@rolldown/binding-android-arm64/-/binding-android-arm64-1.2.12.tgz",
++      "integrity": "sha512-7KHFgQ5VJxIHcLlrwrc3Xbds7oTNQT7Pgi9gQCJKrd2VGab/UksIOYp6VD8MzCstGxOKMgNamPwUCfxPdP1OHg==",
++      "cpu": [
++        "arm64"
++      ],
++      "dev": true,
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "android"
++      ],
++      "peer": true,
++      "engines": {
++        "node": "^20.19.0 || >=22.12.0"
++      }
++    },
++    "node_modules/@rolldown/binding-darwin-arm64": {
++      "version": "1.2.12",
++      "resolved": "https://registry.npmjs.org/@rolldown/binding-darwin-arm64/-/binding-darwin-arm64-1.2.12.tgz",
++      "integrity": "sha512-3YIhqHD96nA5SaYNRBR16HnGv4oavZvXfD/ayHM+oYZ0WD/8lBAtf6zQua4kEyAvpqrluKXl0lnOBoiNby7x9w==",
++      "cpu": [
++        "arm64"
++      ],
++      "dev": true,
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "darwin"
++      ],
++      "peer": true,
++      "engines": {
++        "node": "^20.19.0 || >=22.12.0"
++      }
++    },
++    "node_modules/@rolldown/binding-darwin-x64": {
++      "version": "1.2.12",
++      "resolved": "https://registry.npmjs.org/@rolldown/binding-darwin-x64/-/binding-darwin-x64-1.2.12.tgz",
++      "integrity": "sha512-UuuJ35MFw4gmFOrE9pEqIV+K3syIKveph+Qc1/ljHZVdoDW4pz/JHR/eMVom+TZGl/5OOvGJOWaOCVt3ZfqhxA==",
++      "cpu": [
++        "x64"
++      ],
++      "dev": true,
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "darwin"
++      ],
++      "peer": true,
++      "engines": {
++        "node": "^20.19.0 || >=22.12.0"
++      }
++    },
++    "node_modules/@rolldown/binding-freebsd-x64": {
++      "version": "1.2.12",
++      "resolved": "https://registry.npmjs.org/@rolldown/binding-freebsd-x64/-/binding-freebsd-x64-1.2.12.tgz",
++      "integrity": "sha512-uMvssit0a4W+/7D8CbHUvG719mH3R2jwXAlh/XcPvuHTE0g++LymF88DCGNX0HM2rBOn0xrzgXktIB6fLSJBTQ==",
++      "cpu": [
++        "x64"
++      ],
++      "dev": true,
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "freebsd"
++      ],
++      "peer": true,
++      "engines": {
++        "node": "^20.19.0 || >=22.12.0"
++      }
++    },
++    "node_modules/@rolldown/binding-linux-arm-gnueabihf": {
++      "version": "1.2.12",
++      "resolved": "https://registry.npmjs.org/@rolldown/binding-linux-arm-gnueabihf/-/binding-linux-arm-gnueabihf-1.2.12.tgz",
++      "integrity": "sha512-XcFu0R0xWnwzSf4IQgFH1rJIckPN1pLy2R+4r9IDB7Yfu/ys9cVqfa4pBrMHj7a3gl8mIR4nRNPg0e5IvEVs6g==",
++      "cpu": [
++        "arm"
++      ],
++      "dev": true,
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "linux"
++      ],
++      "peer": true,
++      "engines": {
++        "node": "^20.19.0 || >=22.12.0"
++      }
++    },
++    "node_modules/@rolldown/binding-linux-arm64-gnu": {
++      "version": "1.2.12",
++      "resolved": "https://registry.npmjs.org/@rolldown/binding-linux-arm64-gnu/-/binding-linux-arm64-gnu-1.2.12.tgz",
++      "integrity": "sha512-260UrKgn8tz39ak+SMDOirKzr7V04M9dWPw5llW00SwBivCZoWcRBKV1d8cXnRkUmSZA3BdiUmBHWk7734Ulpw==",
++      "cpu": [
++        "arm64"
++      ],
++      "dev": true,
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "linux"
++      ],
++      "peer": true,
++      "engines": {
++        "node": "^20.19.0 || >=22.12.0"
++      }
++    },
++    "node_modules/@rolldown/binding-linux-arm64-musl": {
++      "version": "1.2.12",
++      "resolved": "https://registry.npmjs.org/@rolldown/binding-linux-arm64-musl/-/binding-linux-arm64-musl-1.2.12.tgz",
++      "integrity": "sha512-5YK1I9SqDkbPgc1IA8BgDl34suqUS2q0KWnBrirm0E51YjOs6eo6dV6jbQfNE/argHRSvd0QUGgtpIoYx+WWpw==",
++      "cpu": [
++        "arm64"
++      ],
++      "dev": true,
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "linux"
++      ],
++      "peer": true,
++      "engines": {
++        "node": "^20.19.0 || >=22.12.0"
++      }
++    },
++    "node_modules/@rolldown/binding-linux-ppc64-gnu": {
++      "version": "1.2.12",
++      "resolved": "https://registry.npmjs.org/@rolldown/binding-linux-ppc64-gnu/-/binding-linux-ppc64-gnu-1.2.12.tgz",
++      "integrity": "sha512-Rkcrmp7eFRg74yL5fXEU91JEWbdEPLevWwGtXpmhbjlD1StScbWTmO94Bhly+Mo+ketKYkdmM1vNUKeWSlx8cQ==",
++      "cpu": [
++        "ppc64"
++      ],
++      "dev": true,
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "linux"
++      ],
++      "peer": true,
++      "engines": {
++        "node": "^20.19.0 || >=22.12.0"
++      }
++    },
++    "node_modules/@rolldown/binding-linux-s390x-gnu": {
++      "version": "1.2.12",
++      "resolved": "https://registry.npmjs.org/@rolldown/binding-linux-s390x-gnu/-/binding-linux-s390x-gnu-1.2.12.tgz",
++      "integrity": "sha512-qvK4DuAsQc2BSjlx+Xr+IzOIvvxbGZqxFwdWfG6F518Erj0GGISyQbJ6pIappnOxlNPzNHvo/L0BwB30GZ+zVw==",
++      "cpu": [
++        "s390x"
++      ],
++      "dev": true,
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "linux"
++      ],
++      "peer": true,
++      "engines": {
++        "node": "^20.19.0 || >=22.12.0"
++      }
++    },
++    "node_modules/@rolldown/binding-linux-x64-gnu": {
++      "version": "1.2.12",
++      "resolved": "https://registry.npmjs.org/@rolldown/binding-linux-x64-gnu/-/binding-linux-x64-gnu-1.2.12.tgz",
++      "integrity": "sha512-Q9uLBO53Xd4QIq1WOycVQyPP1O4HhraEV2qqb3uTrnVw6QZih9duY4vNXOivL1xoUS1/z+W8eF4NMfl2a8Sdjw==",
++      "cpu": [
++        "x64"
++      ],
++      "dev": true,
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "linux"
++      ],
++      "peer": true,
++      "engines": {
++        "node": "^20.19.0 || >=22.12.0"
++      }
++    },
++    "node_modules/@rolldown/binding-linux-x64-musl": {
++      "version": "1.2.12",
++      "resolved": "https://registry.npmjs.org/@rolldown/binding-linux-x64-musl/-/binding-linux-x64-musl-1.2.12.tgz",
++      "integrity": "sha512-3IBxWFMjbOZskDPKv8Lf9BCnahlKuHthWkYnyIxOH/QcJrFcS4EmcenthApkwr/5+nEqZlLzeYbxeMaX7A5u4g==",
++      "cpu": [
++        "x64"
++      ],
++      "dev": true,
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "linux"
++      ],
++      "peer": true,
++      "engines": {
++        "node": "^20.19.0 || >=22.12.0"
++      }
++    },
++    "node_modules/@rolldown/binding-openharmony-arm64": {
++      "version": "1.2.12",
++      "resolved": "https://registry.npmjs.org/@rolldown/binding-openharmony-arm64/-/binding-openharmony-arm64-1.2.12.tgz",
++      "integrity": "sha512-xtX61xg4LKPkPWilZU1ynKClz5Gj4bf74LML4r3eVLWumKnGjoEr1OSHQhMdbBDoYTi+yjrujvpZe2pUnqCrrA==",
++      "cpu": [
++        "arm64"
++      ],
++      "dev": true,
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "openharmony"
++      ],
++      "peer": true,
++      "engines": {
++        "node": "^20.19.0 || >=22.12.0"
++      }
++    },
++    "node_modules/@rolldown/binding-win32-arm64-msvc": {
++      "version": "1.2.12",
++      "resolved": "https://registry.npmjs.org/@rolldown/binding-win32-arm64-msvc/-/binding-win32-arm64-msvc-1.2.12.tgz",
++      "integrity": "sha512-At7fPB6PCaIjzgIhEZFxuT+BBFqiQibJDT4d3PhiR3f4E7bbMZF4aKblbFfEM3sETRDd1YiQx/+U/g/B/ou5Ew==",
++      "cpu": [
++        "arm64"
++      ],
++      "dev": true,
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "win32"
++      ],
++      "peer": true,
++      "engines": {
++        "node": "^20.19.0 || >=22.12.0"
++      }
++    },
++    "node_modules/@rolldown/binding-win32-x64-msvc": {
++      "version": "1.2.12",
++      "resolved": "https://registry.npmjs.org/@rolldown/binding-win32-x64-msvc/-/binding-win32-x64-msvc-1.2.12.tgz",
++      "integrity": "sha512-WIw2haVKwjuYdXkHaoC0mF8Le71TuCBxjrdKqLbJGctbBABj+ClfmNvtbOnzpq3RokNo5+V1qhtSzJyXorsklQ==",
++      "cpu": [
++        "x64"
++      ],
++      "dev": true,
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "win32"
++      ],
++      "peer": true,
++      "engines": {
++        "node": "^20.19.0 || >=22.12.0"
++      }
++    },
++    "node_modules/@rolldown/pluginutils": {
++      "version": "1.0.1",
++      "resolved": "https://registry.npmjs.org/@rolldown/pluginutils/-/pluginutils-1.0.1.tgz",
++      "integrity": "sha512-2j9bGt5Jh8hj+vPtgzPtl72j0yRxHAyumoo6TNfAjsLB04UtpSvPbPcDcBMxz7n+9CYB0c1GxQFxYRg2jimqGw==",
++      "dev": true,
++      "license": "MIT",
++      "peer": true
++    },
++    "node_modules/@types/chai": {
++      "version": "5.2.3",
++      "resolved": "https://registry.npmjs.org/@types/chai/-/chai-5.2.3.tgz",
++      "integrity": "sha512-Mw558oeA9fFbv65/y4mHtXDs9bPnFMZAL/jxdPFUpOHHIXX91mcgEHbS5Lahr+pwZFR8A7GQleRWeI6cGFC2UA==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "@types/deep-eql": "*",
++        "assertion-error": "^2.0.1"
++      }
++    },
++    "node_modules/@types/deep-eql": {
++      "version": "4.0.2",
++      "resolved": "https://registry.npmjs.org/@types/deep-eql/-/deep-eql-4.0.2.tgz",
++      "integrity": "sha512-c9h9dVVMigMPc4bwTvC5dxqtqJZwQPePsWjPlpSOnojbor6pGqdk541lfA7AqFQr5pB1BRdq0juY9db81BwyFw==",
++      "dev": true,
++      "license": "MIT"
++    },
++    "node_modules/@types/estree": {
++      "version": "1.0.9",
++      "resolved": "https://registry.npmjs.org/@types/estree/-/estree-1.0.9.tgz",
++      "integrity": "sha512-GhdPgy1el4/ImP05X05Uw4cw2/M93BCUmnEvWZNStlCzEKME4Fkk+YpoA5OiHNQmoS7Cafb8Xa3Pya8m1Qrzeg==",
++      "dev": true,
++      "license": "MIT"
++    },
++    "node_modules/@types/node": {
++      "version": "22.20.5",
++      "resolved": "https://registry.npmjs.org/@types/node/-/node-22.20.5.tgz",
++      "integrity": "sha512-U2+DNr+wSjpsTS/wZGYHq7GcwfuSmKiKvoPvK22zwTlRhU91yOniN4qRR5KhIjvif7ysw/dz/hKmfDH0Ris4aA==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "undici-types": "~6.21.0"
++      }
++    },
++    "node_modules/@typescript/typescript-aix-ppc64": {
++      "version": "7.0.2",
++      "resolved": "https://registry.npmjs.org/@typescript/typescript-aix-ppc64/-/typescript-aix-ppc64-7.0.2.tgz",
++      "integrity": "sha512-MTKKkWB7p/0E9xi1d1tHtZ5PiLkGEMIq88pK2CubZjOsLtYTLqhgIgi6zepFa+9GHZ6h05NMCkQxGKiPXMxXtQ==",
++      "cpu": [
++        "ppc64"
++      ],
++      "dev": true,
++      "license": "Apache-2.0",
++      "optional": true,
++      "os": [
++        "aix"
++      ],
++      "engines": {
++        "node": ">=16.20.0"
++      }
++    },
++    "node_modules/@typescript/typescript-darwin-arm64": {
++      "version": "7.0.2",
++      "resolved": "https://registry.npmjs.org/@typescript/typescript-darwin-arm64/-/typescript-darwin-arm64-7.0.2.tgz",
++      "integrity": "sha512-gowzar9MwS/aRWp6f3a4KUqzRjAZjOsmGNCM6LcTgXum+dBfgsBVMN+AgvOCCbguXyick6LJhpBszxMebJ8syA==",
++      "cpu": [
++        "arm64"
++      ],
++      "dev": true,
++      "license": "Apache-2.0",
++      "optional": true,
++      "os": [
++        "darwin"
++      ],
++      "engines": {
++        "node": ">=16.20.0"
++      }
++    },
++    "node_modules/@typescript/typescript-darwin-x64": {
++      "version": "7.0.2",
++      "resolved": "https://registry.npmjs.org/@typescript/typescript-darwin-x64/-/typescript-darwin-x64-7.0.2.tgz",
++      "integrity": "sha512-SZ9xZInqApNlNGc9s0W1VSsktYSOe9cFqNOIqmN1Gs8SmkjKZYFt017G4VwPxASInODuAdbTW7sXiFUf893RgA==",
++      "cpu": [
++        "x64"
++      ],
++      "dev": true,
++      "license": "Apache-2.0",
++      "optional": true,
++      "os": [
++        "darwin"
++      ],
++      "engines": {
++        "node": ">=16.20.0"
++      }
++    },
++    "node_modules/@typescript/typescript-freebsd-arm64": {
++      "version": "7.0.2",
++      "resolved": "https://registry.npmjs.org/@typescript/typescript-freebsd-arm64/-/typescript-freebsd-arm64-7.0.2.tgz",
++      "integrity": "sha512-W5NH4y/J0plIIS5b2xvTEkU7JFxyqdMAOgf+Ilhl0vHQXKO5dZoxd+C/jEtq56c4F3wk71RB4BMRQ2XdI+bwYQ==",
++      "cpu": [
++        "arm64"
++      ],
++      "dev": true,
++      "license": "Apache-2.0",
++      "optional": true,
++      "os": [
++        "freebsd"
++      ],
++      "engines": {
++        "node": ">=16.20.0"
++      }
++    },
++    "node_modules/@typescript/typescript-freebsd-x64": {
++      "version": "7.0.2",
++      "resolved": "https://registry.npmjs.org/@typescript/typescript-freebsd-x64/-/typescript-freebsd-x64-7.0.2.tgz",
++      "integrity": "sha512-UMGDx5sTpzNw3WiPebH7l90IWfJggEd+egHt/q6p7/Cm3zqoV7VxkGXt+3DxPIw8CcmvAB0j3sVVfbhX+M4Tpw==",
++      "cpu": [
++        "x64"
++      ],
++      "dev": true,
++      "license": "Apache-2.0",
++      "optional": true,
++      "os": [
++        "freebsd"
++      ],
++      "engines": {
++        "node": ">=16.20.0"
++      }
++    },
++    "node_modules/@typescript/typescript-linux-arm": {
++      "version": "7.0.2",
++      "resolved": "https://registry.npmjs.org/@typescript/typescript-linux-arm/-/typescript-linux-arm-7.0.2.tgz",
++      "integrity": "sha512-gffT3xPz9sR7j/YJExkyPntrI0P2EP9XbOyWzth2/Gs0RstK+90RBcO0ncXoXy/beYll1SXw846Nf2zdnEz0QQ==",
++      "cpu": [
++        "arm"
++      ],
++      "dev": true,
++      "license": "Apache-2.0",
++      "optional": true,
++      "os": [
++        "linux"
++      ],
++      "engines": {
++        "node": ">=16.20.0"
++      }
++    },
++    "node_modules/@typescript/typescript-linux-arm64": {
++      "version": "7.0.2",
++      "resolved": "https://registry.npmjs.org/@typescript/typescript-linux-arm64/-/typescript-linux-arm64-7.0.2.tgz",
++      "integrity": "sha512-Qh4eU4/y3yDjnfjjyPYihMj5/ODIlmt+Bzu17OI+fiSRDW57QmU5SiN63exPRNJPKUzcc1INa1NXdrJ+MqHjUQ==",
++      "cpu": [
++        "arm64"
++      ],
++      "dev": true,
++      "license": "Apache-2.0",
++      "optional": true,
++      "os": [
++        "linux"
++      ],
++      "engines": {
++        "node": ">=16.20.0"
++      }
++    },
++    "node_modules/@typescript/typescript-linux-loong64": {
++      "version": "7.0.2",
++      "resolved": "https://registry.npmjs.org/@typescript/typescript-linux-loong64/-/typescript-linux-loong64-7.0.2.tgz",
++      "integrity": "sha512-uEHck9i8hoAzXPiYRib1O7miOnz23SxIeVl6F4LXox+qov1K35jHcEW6VHKvZI+pyvl7fZEP4MCU5LYvIq1GuQ==",
++      "cpu": [
++        "loong64"
++      ],
++      "dev": true,
++      "license": "Apache-2.0",
++      "optional": true,
++      "os": [
++        "linux"
++      ],
++      "engines": {
++        "node": ">=16.20.0"
++      }
++    },
++    "node_modules/@typescript/typescript-linux-mips64el": {
++      "version": "7.0.2",
++      "resolved": "https://registry.npmjs.org/@typescript/typescript-linux-mips64el/-/typescript-linux-mips64el-7.0.2.tgz",
++      "integrity": "sha512-R4KvAMnE43W5Qeqb0Ly56O3mWMWIAgsMyz36DCaycd5nbg/9kzm0liw3JocfRqyJY0KPmzFjbswozXyW0DnIYA==",
++      "cpu": [
++        "mips64el"
++      ],
++      "dev": true,
++      "license": "Apache-2.0",
++      "optional": true,
++      "os": [
++        "linux"
++      ],
++      "engines": {
++        "node": ">=16.20.0"
++      }
++    },
++    "node_modules/@typescript/typescript-linux-ppc64": {
++      "version": "7.0.2",
++      "resolved": "https://registry.npmjs.org/@typescript/typescript-linux-ppc64/-/typescript-linux-ppc64-7.0.2.tgz",
++      "integrity": "sha512-DORx5b3sd/4S7eayxm4FQv+A7CrkUIGRaHiwI8oiHTAI1fAPWhF4J0vAlkC8biAlHSVVwxMQ3tjZ2/DVbnQiiA==",
++      "cpu": [
++        "ppc64"
++      ],
++      "dev": true,
++      "license": "Apache-2.0",
++      "optional": true,
++      "os": [
++        "linux"
++      ],
++      "engines": {
++        "node": ">=16.20.0"
++      }
++    },
++    "node_modules/@typescript/typescript-linux-riscv64": {
++      "version": "7.0.2",
++      "resolved": "https://registry.npmjs.org/@typescript/typescript-linux-riscv64/-/typescript-linux-riscv64-7.0.2.tgz",
++      "integrity": "sha512-wf0jqEDOjrPRnKwYRyyJDRo11KMbvMFrU+q4zqKyChODBzvlkbhNQfKvLxQCcwTpdDaXSHZTVuh0JoCrKCUMHQ==",
++      "cpu": [
++        "riscv64"
++      ],
++      "dev": true,
++      "license": "Apache-2.0",
++      "optional": true,
++      "os": [
++        "linux"
++      ],
++      "engines": {
++        "node": ">=16.20.0"
++      }
++    },
++    "node_modules/@typescript/typescript-linux-s390x": {
++      "version": "7.0.2",
++      "resolved": "https://registry.npmjs.org/@typescript/typescript-linux-s390x/-/typescript-linux-s390x-7.0.2.tgz",
++      "integrity": "sha512-IkwJc3L7yhytWd/ewjyxNDfOmswCm9GWMJT/ue/dU4aZNbwZeYAetq42VyLmsmSjvoX7z74X6ZaYCtzAr0EuGw==",
++      "cpu": [
++        "s390x"
++      ],
++      "dev": true,
++      "license": "Apache-2.0",
++      "optional": true,
++      "os": [
++        "linux"
++      ],
++      "engines": {
++        "node": ">=16.20.0"
++      }
++    },
++    "node_modules/@typescript/typescript-linux-x64": {
++      "version": "7.0.2",
++      "resolved": "https://registry.npmjs.org/@typescript/typescript-linux-x64/-/typescript-linux-x64-7.0.2.tgz",
++      "integrity": "sha512-EYdf2cNg7rgCWJnxCdJ+F3V39O8ihb37eHAu1LK8oAFizgTQbPOK7zHHXbPt8rX24COqODXeI3sIf0fCXG7H/A==",
++      "cpu": [
++        "x64"
++      ],
++      "dev": true,
++      "license": "Apache-2.0",
++      "optional": true,
++      "os": [
++        "linux"
++      ],
++      "engines": {
++        "node": ">=16.20.0"
++      }
++    },
++    "node_modules/@typescript/typescript-netbsd-arm64": {
++      "version": "7.0.2",
++      "resolved": "https://registry.npmjs.org/@typescript/typescript-netbsd-arm64/-/typescript-netbsd-arm64-7.0.2.tgz",
++      "integrity": "sha512-+polYF4MF04aPpO5FTkHran9yUQDSXqy5GiSDKpsll5jy3l3+g9QLhpf39T+ePtefhXLOGrLl0QIjkQP6VnelA==",
++      "cpu": [
++        "arm64"
++      ],
++      "dev": true,
++      "license": "Apache-2.0",
++      "optional": true,
++      "os": [
++        "netbsd"
++      ],
++      "engines": {
++        "node": ">=16.20.0"
++      }
++    },
++    "node_modules/@typescript/typescript-netbsd-x64": {
++      "version": "7.0.2",
++      "resolved": "https://registry.npmjs.org/@typescript/typescript-netbsd-x64/-/typescript-netbsd-x64-7.0.2.tgz",
++      "integrity": "sha512-8YIT0EHM/3dq10ZOVF/A7pc/YSMtbcecct4rWtexrnSCHOPcpC2KTLXfTCR6vDpnSiY12heNb1GiN/wu+T/FyA==",
++      "cpu": [
++        "x64"
++      ],
++      "dev": true,
++      "license": "Apache-2.0",
++      "optional": true,
++      "os": [
++        "netbsd"
++      ],
++      "engines": {
++        "node": ">=16.20.0"
++      }
++    },
++    "node_modules/@typescript/typescript-openbsd-arm64": {
++      "version": "7.0.2",
++      "resolved": "https://registry.npmjs.org/@typescript/typescript-openbsd-arm64/-/typescript-openbsd-arm64-7.0.2.tgz",
++      "integrity": "sha512-APT8+ClYnuYm1u9+kgGXoMj2VzWzcymwh2gNSQVySHfkRDGOTVkoWLjCmOQSaO+PoqQ57B0flRp9SA+7GnnkzQ==",
++      "cpu": [
++        "arm64"
++      ],
++      "dev": true,
++      "license": "Apache-2.0",
++      "optional": true,
++      "os": [
++        "openbsd"
++      ],
++      "engines": {
++        "node": ">=16.20.0"
++      }
++    },
++    "node_modules/@typescript/typescript-openbsd-x64": {
++      "version": "7.0.2",
++      "resolved": "https://registry.npmjs.org/@typescript/typescript-openbsd-x64/-/typescript-openbsd-x64-7.0.2.tgz",
++      "integrity": "sha512-yX7s+Q0Dln0Dt9tEzZsAjXXR/+ytBM7AlglaqyeMPxQszJ1JhlJdZ6jLA+IzldHtflX81em7lDao1xXu+aRRkg==",
++      "cpu": [
++        "x64"
++      ],
++      "dev": true,
++      "license": "Apache-2.0",
++      "optional": true,
++      "os": [
++        "openbsd"
++      ],
++      "engines": {
++        "node": ">=16.20.0"
++      }
++    },
++    "node_modules/@typescript/typescript-sunos-x64": {
++      "version": "7.0.2",
++      "resolved": "https://registry.npmjs.org/@typescript/typescript-sunos-x64/-/typescript-sunos-x64-7.0.2.tgz",
++      "integrity": "sha512-dLJDGaLZ1D4HPQn62u1n8mBDkJREwMsAkCdkwd4Ieqw+x3TUyTsqY0YiBCtE6H6OzzgGk3iuZ3vFWRS+E8/d1g==",
++      "cpu": [
++        "x64"
++      ],
++      "dev": true,
++      "license": "Apache-2.0",
++      "optional": true,
++      "os": [
++        "sunos"
++      ],
++      "engines": {
++        "node": ">=16.20.0"
++      }
++    },
++    "node_modules/@typescript/typescript-win32-arm64": {
++      "version": "7.0.2",
++      "resolved": "https://registry.npmjs.org/@typescript/typescript-win32-arm64/-/typescript-win32-arm64-7.0.2.tgz",
++      "integrity": "sha512-Gyl1Vy6OsWesLzmq+EP0Fb7b4Nid5232AvcA2SFcdYreldpNtYFFofPjnt62y9hQy7VTaZp65ICJjuAQRaVcIQ==",
++      "cpu": [
++        "arm64"
++      ],
++      "dev": true,
++      "license": "Apache-2.0",
++      "optional": true,
++      "os": [
++        "win32"
++      ],
++      "engines": {
++        "node": ">=16.20.0"
++      }
++    },
++    "node_modules/@typescript/typescript-win32-x64": {
++      "version": "7.0.2",
++      "resolved": "https://registry.npmjs.org/@typescript/typescript-win32-x64/-/typescript-win32-x64-7.0.2.tgz",
++      "integrity": "sha512-0BQ3HkAHHlKLSp1qRvf3SUhGpGsDuhB/jgFw75guyqbxJqEaS0Cw/VFO8i2nHglJUzQCRtMMR/IBAKE3ETMC4g==",
++      "cpu": [
++        "x64"
++      ],
++      "dev": true,
++      "license": "Apache-2.0",
++      "optional": true,
++      "os": [
++        "win32"
++      ],
++      "engines": {
++        "node": ">=16.20.0"
++      }
++    },
++    "node_modules/@vitest/mocker": {
++      "version": "5.0.3",
++      "resolved": "https://registry.npmjs.org/@vitest/mocker/-/mocker-5.0.3.tgz",
++      "integrity": "sha512-T8sWAIbkSyAjkwTcaEc3Iu0o9A27X1/kdXrizhZkGuSKScRQtRzclfAMpOTcGdXCsqxeWlpGy3XjqaW8CpLORg==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "@jridgewell/trace-mapping": "0.3.31",
++        "@vitest/spy": "5.0.3",
++        "estree-walker": "^3.0.3",
++        "magic-string": "^1.2.3"
++      },
++      "funding": {
++        "url": "https://opencollective.com/vitest"
++      },
++      "peerDependencies": {
++        "msw": "^2.4.9",
++        "vite": "^6.0.0 || ^7.0.0 || ^8.0.0"
++      },
++      "peerDependenciesMeta": {
++        "msw": {
++          "optional": true
++        },
++        "vite": {
++          "optional": true
++        }
++      }
++    },
++    "node_modules/@vitest/spy": {
++      "version": "5.0.3",
++      "resolved": "https://registry.npmjs.org/@vitest/spy/-/spy-5.0.3.tgz",
++      "integrity": "sha512-XhFysQTB8AZ+P4gMi+Lpo99vg2AZi0qKpaB9yXQl37+CaMEAPO3iH/wGVnSyL5MPERiLezpqTVtrR6UZH5GCXg==",
++      "dev": true,
++      "license": "MIT",
++      "funding": {
++        "url": "https://opencollective.com/vitest"
++      }
++    },
++    "node_modules/abstract-logging": {
++      "version": "2.0.1",
++      "resolved": "https://registry.npmjs.org/abstract-logging/-/abstract-logging-2.0.1.tgz",
++      "integrity": "sha512-2BjRTZxTPvheOvGbBslFSYOUkr+SjPtOnrLP33f+VIWLzezQpZcqVg7ja3L4dBXmzzgwT+a029jRx5PCi3JuiA==",
++      "license": "MIT"
++    },
++    "node_modules/ajv": {
++      "version": "8.20.0",
++      "resolved": "https://registry.npmjs.org/ajv/-/ajv-8.20.0.tgz",
++      "integrity": "sha512-Thbli+OlOj+iMPYFBVBfJ3OmCAnaSyNn4M1vz9T6Gka5Jt9ba/HIR56joy65tY6kx/FCF5VXNB819Y7/GUrBGA==",
++      "license": "MIT",
++      "dependencies": {
++        "fast-deep-equal": "^3.1.3",
++        "fast-uri": "^3.0.1",
++        "json-schema-traverse": "^1.0.0",
++        "require-from-string": "^2.0.2"
++      },
++      "funding": {
++        "type": "github",
++        "url": "https://github.com/sponsors/epoberezkin"
++      }
++    },
++    "node_modules/ajv-formats": {
++      "version": "3.0.1",
++      "resolved": "https://registry.npmjs.org/ajv-formats/-/ajv-formats-3.0.1.tgz",
++      "integrity": "sha512-8iUql50EUR+uUcdRQ3HDqa6EVyo3docL8g5WJ3FNcWmu62IbkGUue/pEyLBW8VGKKucTPgqeks4fIU1DA4yowQ==",
++      "license": "MIT",
++      "dependencies": {
++        "ajv": "^8.0.0"
++      },
++      "peerDependencies": {
++        "ajv": "^8.0.0"
++      },
++      "peerDependenciesMeta": {
++        "ajv": {
++          "optional": true
++        }
++      }
++    },
++    "node_modules/ajv/node_modules/fast-uri": {
++      "version": "3.1.8",
++      "resolved": "https://registry.npmjs.org/fast-uri/-/fast-uri-3.1.8.tgz",
++      "integrity": "sha512-GZMtZUTNRpOVIECoXwLNZS5xUGE+mVNbTB8h/7Rwh2TFWcBQiPzTgyZi05BF9UMZKkLJv8XBRJTlU7zg8+ZfMg==",
++      "funding": [
++        {
++          "type": "github",
++          "url": "https://github.com/sponsors/fastify"
++        },
++        {
++          "type": "opencollective",
++          "url": "https://opencollective.com/fastify"
++        }
++      ],
++      "license": "BSD-3-Clause"
++    },
++    "node_modules/assertion-error": {
++      "version": "2.0.1",
++      "resolved": "https://registry.npmjs.org/assertion-error/-/assertion-error-2.0.1.tgz",
++      "integrity": "sha512-Izi8RQcffqCeNVgFigKli1ssklIbpHnCYc6AknXGYoB6grJqyeby7jv12JUQgmTAnIDnbck1uxksT4dzN3PWBA==",
++      "dev": true,
++      "license": "MIT",
++      "engines": {
++        "node": ">=12"
++      }
++    },
++    "node_modules/atomic-sleep": {
++      "version": "1.0.0",
++      "resolved": "https://registry.npmjs.org/atomic-sleep/-/atomic-sleep-1.0.0.tgz",
++      "integrity": "sha512-kNOjDqAh7px0XWNI+4QbzoiR/nTkHAWNud2uvnJquD1/x5a7EQZMJT0AczqK0Qn67oY/TTQ1LbUKajZpp3I9tQ==",
++      "license": "MIT",
++      "engines": {
++        "node": ">=8.0.0"
++      }
++    },
++    "node_modules/avvio": {
++      "version": "9.3.0",
++      "resolved": "https://registry.npmjs.org/avvio/-/avvio-9.3.0.tgz",
++      "integrity": "sha512-g2tQ7LE7oOSqDfwEm3M+ZCMTJc7KiZCdJ4UwyZJb5ckTKyYu50OYmvv0mCFXPuYXoM4zkSt8zM9XQ9KCvxA74A==",
++      "funding": [
++        {
++          "type": "github",
++          "url": "https://github.com/sponsors/fastify"
++        },
++        {
++          "type": "opencollective",
++          "url": "https://opencollective.com/fastify"
++        }
++      ],
++      "license": "MIT",
++      "dependencies": {
++        "@fastify/error": "^4.0.0",
++        "fastq": "^1.17.1"
++      }
++    },
++    "node_modules/chai": {
++      "version": "6.3.0",
++      "resolved": "https://registry.npmjs.org/chai/-/chai-6.3.0.tgz",
++      "integrity": "sha512-XWAtwJ6OHO+tj0EKCs0Y2UamnyOxseZWltU4x2U2wh8g4AigdjwvtUjvLP2tqkA/avxHEtzxNaqGq/YGNwckKg==",
++      "dev": true,
++      "license": "MIT",
++      "engines": {
++        "node": ">=18"
++      }
++    },
++    "node_modules/cookie": {
++      "version": "1.1.1",
++      "resolved": "https://registry.npmjs.org/cookie/-/cookie-1.1.1.tgz",
++      "integrity": "sha512-ei8Aos7ja0weRpFzJnEA9UHJ/7XQmqglbRwnf2ATjcB9Wq874VKH9kfjjirM6UhU2/E5fFYadylyhFldcqSidQ==",
++      "license": "MIT",
++      "engines": {
++        "node": ">=18"
++      },
++      "funding": {
++        "type": "opencollective",
++        "url": "https://opencollective.com/express"
++      }
++    },
++    "node_modules/dequal": {
++      "version": "2.0.3",
++      "resolved": "https://registry.npmjs.org/dequal/-/dequal-2.0.3.tgz",
++      "integrity": "sha512-0je+qPKHEMohvfRTCEo3CrPG6cAzAYgmzKyxRiYSSDkS6eGJdyVJm7WaYA5ECaAD9wLB2T4EEeymA5aFVcYXCA==",
++      "license": "MIT",
++      "engines": {
++        "node": ">=6"
++      }
++    },
++    "node_modules/detect-libc": {
++      "version": "2.1.2",
++      "resolved": "https://registry.npmjs.org/detect-libc/-/detect-libc-2.1.2.tgz",
++      "integrity": "sha512-Btj2BOOO83o3WyH59e8MgXsxEQVcarkUOpEYrubB0urwnN10yQ364rsiByU11nZlqWYZm05i/of7io4mzihBtQ==",
++      "dev": true,
++      "license": "Apache-2.0",
++      "peer": true,
++      "engines": {
++        "node": ">=8"
++      }
++    },
++    "node_modules/es-module-lexer": {
++      "version": "2.3.2",
++      "resolved": "https://registry.npmjs.org/es-module-lexer/-/es-module-lexer-2.3.2.tgz",
++      "integrity": "sha512-poHGpORABojJJucnV9KbOavETW8lBVnphkW77ER5/BQ5Fz7oXSoCNek7IH3vR5nRjdsEz926ibFYX8KtLQmdyw==",
++      "dev": true,
++      "license": "MIT"
++    },
++    "node_modules/estree-walker": {
++      "version": "3.0.3",
++      "resolved": "https://registry.npmjs.org/estree-walker/-/estree-walker-3.0.3.tgz",
++      "integrity": "sha512-7RUKfXgSMMkzt6ZuXmqapOurLGPPfgj6l9uRZ7lRGolvk0y2yocc35LdcxKC5PQZdn2DMqioAQ2NoWcrTKmm6g==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "@types/estree": "^1.0.0"
++      }
++    },
++    "node_modules/expect-type": {
++      "version": "1.4.0",
++      "resolved": "https://registry.npmjs.org/expect-type/-/expect-type-1.4.0.tgz",
++      "integrity": "sha512-KfYbmpRm0VbLjEvVa9yGwCi9GI34xvi7A/HXYWQO65CSD2u3MczUJSuwXKFIxlGsgBQizV9q5J9NHj4VG0n+pA==",
++      "dev": true,
++      "license": "Apache-2.0",
++      "engines": {
++        "node": ">=12.0.0"
++      }
++    },
++    "node_modules/fast-decode-uri-component": {
++      "version": "1.0.1",
++      "resolved": "https://registry.npmjs.org/fast-decode-uri-component/-/fast-decode-uri-component-1.0.1.tgz",
++      "integrity": "sha512-WKgKWg5eUxvRZGwW8FvfbaH7AXSh2cL+3j5fMGzUMCxWBJ3dV3a7Wz8y2f/uQ0e3B6WmodD3oS54jTQ9HVTIIg==",
++      "license": "MIT"
++    },
++    "node_modules/fast-deep-equal": {
++      "version": "3.1.3",
++      "resolved": "https://registry.npmjs.org/fast-deep-equal/-/fast-deep-equal-3.1.3.tgz",
++      "integrity": "sha512-f3qQ9oQy9j2AhBe/H9VC91wLmKBCCU/gDOnKNAYG5hswO7BLKj09Hc5HYNz9cGI++xlpDCIgDaitVs03ATR84Q==",
++      "license": "MIT"
++    },
++    "node_modules/fast-json-stringify": {
++      "version": "7.0.1",
++      "resolved": "https://registry.npmjs.org/fast-json-stringify/-/fast-json-stringify-7.0.1.tgz",
++      "integrity": "sha512-eRSayARSbbwlBjpP4vnTTIRD5QPcIrmihPxDeN1DtKnHPg66UuJLx+8hlK1kaFdjvzyQ/dzALoi4vwAQ+T+iZA==",
++      "funding": [
++        {
++          "type": "github",
++          "url": "https://github.com/sponsors/fastify"
++        },
++        {
++          "type": "opencollective",
++          "url": "https://opencollective.com/fastify"
++        }
++      ],
++      "license": "MIT",
++      "dependencies": {
++        "@fastify/merge-json-schemas": "^0.2.0",
++        "ajv": "^8.12.0",
++        "ajv-formats": "^3.0.1",
++        "fast-uri": "^4.0.0",
++        "json-schema-ref-resolver": "^3.0.0",
++        "rfdc": "^1.2.0"
++      }
++    },
++    "node_modules/fast-querystring": {
++      "version": "1.1.2",
++      "resolved": "https://registry.npmjs.org/fast-querystring/-/fast-querystring-1.1.2.tgz",
++      "integrity": "sha512-g6KuKWmFXc0fID8WWH0jit4g0AGBoJhCkJMb1RmbsSEUNvQ+ZC8D6CUZ+GtF8nMzSPXnhiePyyqqipzNNEnHjg==",
++      "license": "MIT",
++      "dependencies": {
++        "fast-decode-uri-component": "^1.0.1"
++      }
++    },
++    "node_modules/fast-uri": {
++      "version": "4.2.1",
++      "resolved": "https://registry.npmjs.org/fast-uri/-/fast-uri-4.2.1.tgz",
++      "integrity": "sha512-TmHQgewjHtMq1E5QKA0tOE0yeYGQs25KZC/ziJpubRtWI15W92e6vPFydWOeZBVROSHBYw/QhD9d5OefdD6LDg==",
++      "funding": [
++        {
++          "type": "github",
++          "url": "https://github.com/sponsors/fastify"
++        },
++        {
++          "type": "opencollective",
++          "url": "https://opencollective.com/fastify"
++        }
++      ],
++      "license": "BSD-3-Clause"
++    },
++    "node_modules/fastify": {
++      "version": "5.12.5",
++      "resolved": "https://registry.npmjs.org/fastify/-/fastify-5.12.5.tgz",
++      "integrity": "sha512-OB2k1dlxs5/NAABqeKV2FUHkSD2BbENsCak8yULVcymn3fHIPDVa9TI3SDnJSWYSllZmSYuZXy2gTnsT+Sut1A==",
++      "funding": [
++        {
++          "type": "github",
++          "url": "https://github.com/sponsors/fastify"
++        },
++        {
++          "type": "opencollective",
++          "url": "https://opencollective.com/fastify"
++        }
++      ],
++      "license": "MIT",
++      "dependencies": {
++        "@fastify/ajv-compiler": "^4.0.5",
++        "@fastify/error": "^4.0.0",
++        "@fastify/fast-json-stringify-compiler": "^5.0.0",
++        "@fastify/proxy-addr": "^5.0.0",
++        "abstract-logging": "^2.0.1",
++        "avvio": "^9.0.0",
++        "fast-json-stringify": "^7.0.0",
++        "find-my-way": "^9.6.0",
++        "light-my-request": "^6.0.0",
++        "pino": "^9.14.0 || ^10.1.0",
++        "process-warning": "^5.1.0",
++        "rfdc": "^1.3.1",
++        "secure-json-parse": "^4.0.0",
++        "semver": "^7.6.0",
++        "toad-cache": "^3.7.0"
++      }
++    },
++    "node_modules/fastq": {
++      "version": "1.20.3",
++      "resolved": "https://registry.npmjs.org/fastq/-/fastq-1.20.3.tgz",
++      "integrity": "sha512-XKv5nnLs6nLF71NgiKJLIZFLkPyIEuOselLG7ujZnGrRfQK8HpvY+WqKhAJUAdLomwVHErVS4LfxFlPq0/FTAw==",
++      "license": "ISC",
++      "dependencies": {
++        "reusify": "^1.0.4"
++      }
++    },
++    "node_modules/fdir": {
++      "version": "6.5.0",
++      "resolved": "https://registry.npmjs.org/fdir/-/fdir-6.5.0.tgz",
++      "integrity": "sha512-tIbYtZbucOs0BRGqPJkshJUYdL+SDH7dVM8gjy+ERp3WAUjLEFJE+02kanyHtwjWOnwrKYBiwAmM0p4kLJAnXg==",
++      "dev": true,
++      "license": "MIT",
++      "engines": {
++        "node": ">=12.0.0"
++      },
++      "peerDependencies": {
++        "picomatch": "^3 || ^4"
++      },
++      "peerDependenciesMeta": {
++        "picomatch": {
++          "optional": true
++        }
++      }
++    },
++    "node_modules/find-my-way": {
++      "version": "9.9.0",
++      "resolved": "https://registry.npmjs.org/find-my-way/-/find-my-way-9.9.0.tgz",
++      "integrity": "sha512-sJsgZ1sQH2UDuowPuMKg8az7Qc8F0jnj+SKkFWU/+T0xcFlgV5skgXOGUqmQzOdmW6ALA7AhJINWx3qFBkbLHA==",
++      "license": "MIT",
++      "dependencies": {
++        "fast-deep-equal": "^3.1.3",
++        "fast-querystring": "^1.0.0",
++        "safe-regex2": "^5.0.0"
++      },
++      "engines": {
++        "node": ">=20"
++      }
++    },
++    "node_modules/fsevents": {
++      "version": "2.3.3",
++      "resolved": "https://registry.npmjs.org/fsevents/-/fsevents-2.3.3.tgz",
++      "integrity": "sha512-5xoDfX+fL7faATnagmWPpbFtwh/R77WmMMqqHGS65C3vvB0YHrgF+B1YmZ3441tMj5n63k0212XNoJwzlhffQw==",
++      "dev": true,
++      "hasInstallScript": true,
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "darwin"
++      ],
++      "peer": true,
++      "engines": {
++        "node": "^8.16.0 || ^10.6.0 || >=11.0.0"
++      }
++    },
++    "node_modules/ipaddr.js": {
++      "version": "2.5.0",
++      "resolved": "https://registry.npmjs.org/ipaddr.js/-/ipaddr.js-2.5.0.tgz",
++      "integrity": "sha512-aq+t5NAc+cS6rZQQVWC2x98CPqGtKKTMDd4Gaodv0wShnItdKg/51djkGJ1hqH+Oy0ivDftCbSLCQob8zso01w==",
++      "license": "MIT",
++      "engines": {
++        "node": ">= 10"
++      }
++    },
++    "node_modules/json-schema-ref-resolver": {
++      "version": "3.0.0",
++      "resolved": "https://registry.npmjs.org/json-schema-ref-resolver/-/json-schema-ref-resolver-3.0.0.tgz",
++      "integrity": "sha512-hOrZIVL5jyYFjzk7+y7n5JDzGlU8rfWDuYyHwGa2WA8/pcmMHezp2xsVwxrebD/Q9t8Nc5DboieySDpCp4WG4A==",
++      "funding": [
++        {
++          "type": "github",
++          "url": "https://github.com/sponsors/fastify"
++        },
++        {
++          "type": "opencollective",
++          "url": "https://opencollective.com/fastify"
++        }
++      ],
++      "license": "MIT",
++      "dependencies": {
++        "dequal": "^2.0.3"
++      }
++    },
++    "node_modules/json-schema-traverse": {
++      "version": "1.0.0",
++      "resolved": "https://registry.npmjs.org/json-schema-traverse/-/json-schema-traverse-1.0.0.tgz",
++      "integrity": "sha512-NM8/P9n3XjXhIZn1lLhkFaACTOURQXjWhV4BA/RnOv8xvgqtqpAX9IO4mRQxSx1Rlo4tqzeqb0sOlruaOy3dug==",
++      "license": "MIT"
++    },
++    "node_modules/light-my-request": {
++      "version": "6.6.0",
++      "resolved": "https://registry.npmjs.org/light-my-request/-/light-my-request-6.6.0.tgz",
++      "integrity": "sha512-CHYbu8RtboSIoVsHZ6Ye4cj4Aw/yg2oAFimlF7mNvfDV192LR7nDiKtSIfCuLT7KokPSTn/9kfVLm5OGN0A28A==",
++      "funding": [
++        {
++          "type": "github",
++          "url": "https://github.com/sponsors/fastify"
++        },
++        {
++          "type": "opencollective",
++          "url": "https://opencollective.com/fastify"
++        }
++      ],
++      "license": "BSD-3-Clause",
++      "dependencies": {
++        "cookie": "^1.0.1",
++        "process-warning": "^4.0.0",
++        "set-cookie-parser": "^2.6.0"
++      }
++    },
++    "node_modules/light-my-request/node_modules/process-warning": {
++      "version": "4.0.1",
++      "resolved": "https://registry.npmjs.org/process-warning/-/process-warning-4.0.1.tgz",
++      "integrity": "sha512-3c2LzQ3rY9d0hc1emcsHhfT9Jwz0cChib/QN89oME2R451w5fy3f0afAhERFZAwrbDU43wk12d0ORBpDVME50Q==",
++      "funding": [
++        {
++          "type": "github",
++          "url": "https://github.com/sponsors/fastify"
++        },
++        {
++          "type": "opencollective",
++          "url": "https://opencollective.com/fastify"
++        }
++      ],
++      "license": "MIT"
++    },
++    "node_modules/lightningcss": {
++      "version": "1.33.0",
++      "resolved": "https://registry.npmjs.org/lightningcss/-/lightningcss-1.33.0.tgz",
++      "integrity": "sha512-WkUDrojuJs0xkgGf2udWxa3yGBRxPtxUkB79i6aCZLRgc7PM8fZe9TosfPDcvEpQZbuFASnHYmRLBLUbmLOIIA==",
++      "dev": true,
++      "license": "MPL-2.0",
++      "peer": true,
++      "dependencies": {
++        "detect-libc": "^2.0.3"
++      },
++      "engines": {
++        "node": ">= 12.0.0"
++      },
++      "funding": {
++        "type": "opencollective",
++        "url": "https://opencollective.com/parcel"
++      },
++      "optionalDependencies": {
++        "lightningcss-android-arm64": "1.33.0",
++        "lightningcss-darwin-arm64": "1.33.0",
++        "lightningcss-darwin-x64": "1.33.0",
++        "lightningcss-freebsd-x64": "1.33.0",
++        "lightningcss-linux-arm-gnueabihf": "1.33.0",
++        "lightningcss-linux-arm64-gnu": "1.33.0",
++        "lightningcss-linux-arm64-musl": "1.33.0",
++        "lightningcss-linux-x64-gnu": "1.33.0",
++        "lightningcss-linux-x64-musl": "1.33.0",
++        "lightningcss-win32-arm64-msvc": "1.33.0",
++        "lightningcss-win32-x64-msvc": "1.33.0"
++      }
++    },
++    "node_modules/lightningcss-android-arm64": {
++      "version": "1.33.0",
++      "resolved": "https://registry.npmjs.org/lightningcss-android-arm64/-/lightningcss-android-arm64-1.33.0.tgz",
++      "integrity": "sha512-gEpRTalKdosp4Bb8qWtc2iOgE5SeIHlpS1up9bFq2wAyYhl1UdTObYiHe98zEM9SQvSoqQZ1IQD0JNpg3Ml5pg==",
++      "cpu": [
++        "arm64"
++      ],
++      "dev": true,
++      "license": "MPL-2.0",
++      "optional": true,
++      "os": [
++        "android"
++      ],
++      "peer": true,
++      "engines": {
++        "node": ">= 12.0.0"
++      },
++      "funding": {
++        "type": "opencollective",
++        "url": "https://opencollective.com/parcel"
++      }
++    },
++    "node_modules/lightningcss-darwin-arm64": {
++      "version": "1.33.0",
++      "resolved": "https://registry.npmjs.org/lightningcss-darwin-arm64/-/lightningcss-darwin-arm64-1.33.0.tgz",
++      "integrity": "sha512-Sciaz8eenNTKn9b3t7+xr0ipTp9YxKQY4npwQ3mrRuL0BAVHBLyZxofhaKBAVtzmtRZ/zTyo0/to4B1uWG/Djg==",
++      "cpu": [
++        "arm64"
++      ],
++      "dev": true,
++      "license": "MPL-2.0",
++      "optional": true,
++      "os": [
++        "darwin"
++      ],
++      "peer": true,
++      "engines": {
++        "node": ">= 12.0.0"
++      },
++      "funding": {
++        "type": "opencollective",
++        "url": "https://opencollective.com/parcel"
++      }
++    },
++    "node_modules/lightningcss-darwin-x64": {
++      "version": "1.33.0",
++      "resolved": "https://registry.npmjs.org/lightningcss-darwin-x64/-/lightningcss-darwin-x64-1.33.0.tgz",
++      "integrity": "sha512-Z5UPAxzrjlWNNyGy6i65cJzzvgJ5D3T6wMvs+gWpY9d7qRhANrxqAp6LhxIgZhWEw18RfJTGcRxjuLIBr+m8XQ==",
++      "cpu": [
++        "x64"
++      ],
++      "dev": true,
++      "license": "MPL-2.0",
++      "optional": true,
++      "os": [
++        "darwin"
++      ],
++      "peer": true,
++      "engines": {
++        "node": ">= 12.0.0"
++      },
++      "funding": {
++        "type": "opencollective",
++        "url": "https://opencollective.com/parcel"
++      }
++    },
++    "node_modules/lightningcss-freebsd-x64": {
++      "version": "1.33.0",
++      "resolved": "https://registry.npmjs.org/lightningcss-freebsd-x64/-/lightningcss-freebsd-x64-1.33.0.tgz",
++      "integrity": "sha512-QQM/Ti/hQajJwCY+RiWuCZ9sdtI/XQk7nDK5vC8kkdwixezOlDgvDx7+RT+QjK6FcFT4MpsuoBnHIo/O3StRRg==",
++      "cpu": [
++        "x64"
++      ],
++      "dev": true,
++      "license": "MPL-2.0",
++      "optional": true,
++      "os": [
++        "freebsd"
++      ],
++      "peer": true,
++      "engines": {
++        "node": ">= 12.0.0"
++      },
++      "funding": {
++        "type": "opencollective",
++        "url": "https://opencollective.com/parcel"
++      }
++    },
++    "node_modules/lightningcss-linux-arm-gnueabihf": {
++      "version": "1.33.0",
++      "resolved": "https://registry.npmjs.org/lightningcss-linux-arm-gnueabihf/-/lightningcss-linux-arm-gnueabihf-1.33.0.tgz",
++      "integrity": "sha512-N7FVBe6iS24MlM6R/4RBTxGhQheZGs7tiQ9U32UtF75NzP5Q7xWPRqLBCKxlRQRk3rY1jCIPLzx7WzOhuUIRLQ==",
++      "cpu": [
++        "arm"
++      ],
++      "dev": true,
++      "license": "MPL-2.0",
++      "optional": true,
++      "os": [
++        "linux"
++      ],
++      "peer": true,
++      "engines": {
++        "node": ">= 12.0.0"
++      },
++      "funding": {
++        "type": "opencollective",
++        "url": "https://opencollective.com/parcel"
++      }
++    },
++    "node_modules/lightningcss-linux-arm64-gnu": {
++      "version": "1.33.0",
++      "resolved": "https://registry.npmjs.org/lightningcss-linux-arm64-gnu/-/lightningcss-linux-arm64-gnu-1.33.0.tgz",
++      "integrity": "sha512-j2v/itmy4HlNxlc6voKXYgBqNi0Ng2LShg4z7GufpEgs05P+2suBVyi9I6YHq5uoVFx9ETin3eCEhLVyXGQnKg==",
++      "cpu": [
++        "arm64"
++      ],
++      "dev": true,
++      "license": "MPL-2.0",
++      "optional": true,
++      "os": [
++        "linux"
++      ],
++      "peer": true,
++      "engines": {
++        "node": ">= 12.0.0"
++      },
++      "funding": {
++        "type": "opencollective",
++        "url": "https://opencollective.com/parcel"
++      }
++    },
++    "node_modules/lightningcss-linux-arm64-musl": {
++      "version": "1.33.0",
++      "resolved": "https://registry.npmjs.org/lightningcss-linux-arm64-musl/-/lightningcss-linux-arm64-musl-1.33.0.tgz",
++      "integrity": "sha512-yiO5ROMuYQgXbC60yjZU5CYSFZGKXL0HFATXt9mHJn1+zW55oCtMI9NfcVhYLMFDL7gV7oBPon/EmMMGg2OvtQ==",
++      "cpu": [
++        "arm64"
++      ],
++      "dev": true,
++      "license": "MPL-2.0",
++      "optional": true,
++      "os": [
++        "linux"
++      ],
++      "peer": true,
++      "engines": {
++        "node": ">= 12.0.0"
++      },
++      "funding": {
++        "type": "opencollective",
++        "url": "https://opencollective.com/parcel"
++      }
++    },
++    "node_modules/lightningcss-linux-x64-gnu": {
++      "version": "1.33.0",
++      "resolved": "https://registry.npmjs.org/lightningcss-linux-x64-gnu/-/lightningcss-linux-x64-gnu-1.33.0.tgz",
++      "integrity": "sha512-ar+Ju7LmcN0Jo4FpL4hpFybwNG9/3A/Br5KW2n2jyODg3MEZXaDYADdemoNS+BDNfMgKvylJLj4S5tyRActuAg==",
++      "cpu": [
++        "x64"
++      ],
++      "dev": true,
++      "license": "MPL-2.0",
++      "optional": true,
++      "os": [
++        "linux"
++      ],
++      "peer": true,
++      "engines": {
++        "node": ">= 12.0.0"
++      },
++      "funding": {
++        "type": "opencollective",
++        "url": "https://opencollective.com/parcel"
++      }
++    },
++    "node_modules/lightningcss-linux-x64-musl": {
++      "version": "1.33.0",
++      "resolved": "https://registry.npmjs.org/lightningcss-linux-x64-musl/-/lightningcss-linux-x64-musl-1.33.0.tgz",
++      "integrity": "sha512-RYiYbkokw0trfKqqzfF55lginwEPrD3OJDfTuJzFs1MK6iFnDenaz1fqLLtX4ITG3OktJQXOeTaw1awrBAlZPw==",
++      "cpu": [
++        "x64"
++      ],
++      "dev": true,
++      "license": "MPL-2.0",
++      "optional": true,
++      "os": [
++        "linux"
++      ],
++      "peer": true,
++      "engines": {
++        "node": ">= 12.0.0"
++      },
++      "funding": {
++        "type": "opencollective",
++        "url": "https://opencollective.com/parcel"
++      }
++    },
++    "node_modules/lightningcss-win32-arm64-msvc": {
++      "version": "1.33.0",
++      "resolved": "https://registry.npmjs.org/lightningcss-win32-arm64-msvc/-/lightningcss-win32-arm64-msvc-1.33.0.tgz",
++      "integrity": "sha512-1K+MPfLSFVpphzpdbfkhlWk6wBrTObBzS2T6db10PNOZgR9GoVsAWzwNyuhUYYbTp23j+4RrncfujZ4uAzXvwA==",
++      "cpu": [
++        "arm64"
++      ],
++      "dev": true,
++      "license": "MPL-2.0",
++      "optional": true,
++      "os": [
++        "win32"
++      ],
++      "peer": true,
++      "engines": {
++        "node": ">= 12.0.0"
++      },
++      "funding": {
++        "type": "opencollective",
++        "url": "https://opencollective.com/parcel"
++      }
++    },
++    "node_modules/lightningcss-win32-x64-msvc": {
++      "version": "1.33.0",
++      "resolved": "https://registry.npmjs.org/lightningcss-win32-x64-msvc/-/lightningcss-win32-x64-msvc-1.33.0.tgz",
++      "integrity": "sha512-OlEICDx/Xl0FqSp4bry8zFnCvGpig3Gl4gCquvYwHuqJKEC1+n9NgDniFvqHGmMv1ZkqDJrDqKKSykTDX+ehuA==",
++      "cpu": [
++        "x64"
++      ],
++      "dev": true,
++      "license": "MPL-2.0",
++      "optional": true,
++      "os": [
++        "win32"
++      ],
++      "peer": true,
++      "engines": {
++        "node": ">= 12.0.0"
++      },
++      "funding": {
++        "type": "opencollective",
++        "url": "https://opencollective.com/parcel"
++      }
++    },
++    "node_modules/magic-string": {
++      "version": "1.4.2",
++      "resolved": "https://registry.npmjs.org/magic-string/-/magic-string-1.4.2.tgz",
++      "integrity": "sha512-vG+rjFRj1PqdIBozIxAGMjPlOhaVe+GXpbttY/iSK7rGcJRMlwNJO7dcUwmUqkymsFLJiNGI06t4D7Fr7yRC9g==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "@jridgewell/sourcemap-codec": "^1.6.0"
++      }
++    },
++    "node_modules/nanoid": {
++      "version": "3.3.19",
++      "resolved": "https://registry.npmjs.org/nanoid/-/nanoid-3.3.19.tgz",
++      "integrity": "sha512-Y2tUNy4ouw6tq5oDSKeQYGOyhkUBhNOcGV/02KC+6kd9eDGqdZd++mjMiIDilrBYvjEnCYvVtsuHCuP+okSfug==",
++      "dev": true,
++      "funding": [
++        {
++          "type": "github",
++          "url": "https://github.com/sponsors/ai"
++        }
++      ],
++      "license": "MIT",
++      "peer": true,
++      "bin": {
++        "nanoid": "bin/nanoid.cjs"
++      },
++      "engines": {
++        "node": "^10 || ^12 || ^13.7 || ^14 || >=15.0.1"
++      }
++    },
++    "node_modules/obug": {
++      "version": "2.2.1",
++      "resolved": "https://registry.npmjs.org/obug/-/obug-2.2.1.tgz",
++      "integrity": "sha512-XrsrhT5sybtKI6wakr2SPOlGZWWYbUXZ7a0jT8/QOeAPau+1X/bSegNe5YR75oJmEZQbKningirmGOEJCIk61Q==",
++      "dev": true,
++      "funding": [
++        "https://github.com/sponsors/sxzz",
++        "https://opencollective.com/debug"
++      ],
++      "license": "MIT",
++      "engines": {
++        "node": ">=12.20.0"
++      }
++    },
++    "node_modules/on-exit-leak-free": {
++      "version": "2.1.2",
++      "resolved": "https://registry.npmjs.org/on-exit-leak-free/-/on-exit-leak-free-2.1.2.tgz",
++      "integrity": "sha512-0eJJY6hXLGf1udHwfNftBqH+g73EU4B504nZeKpz1sYRKafAghwxEJunB2O7rDZkL4PGfsMVnTXZ2EjibbqcsA==",
++      "license": "MIT",
++      "engines": {
++        "node": ">=14.0.0"
++      }
++    },
++    "node_modules/picocolors": {
++      "version": "1.1.1",
++      "resolved": "https://registry.npmjs.org/picocolors/-/picocolors-1.1.1.tgz",
++      "integrity": "sha512-xceH2snhtb5M9liqDsmEw56le376mTZkEX/jEb/RxNFyegNul7eNslCXP9FDj/Lcu0X8KEyMceP2ntpaHrDEVA==",
++      "dev": true,
++      "license": "ISC",
++      "peer": true
++    },
++    "node_modules/picomatch": {
++      "version": "4.0.7",
++      "resolved": "https://registry.npmjs.org/picomatch/-/picomatch-4.0.7.tgz",
++      "integrity": "sha512-qcJu88Q2IWqJsDD529JKMdwGm/dvInW4HvQnRwiH9JtihJvzGOscDtHE3x1pBKeUOTysQ8kVmLnJ2kJu7yhcGA==",
++      "dev": true,
++      "license": "MIT",
++      "engines": {
++        "node": ">=12"
++      },
++      "funding": {
++        "url": "https://github.com/sponsors/jonschlinkert"
++      }
++    },
++    "node_modules/pino": {
++      "version": "10.3.1",
++      "resolved": "https://registry.npmjs.org/pino/-/pino-10.3.1.tgz",
++      "integrity": "sha512-r34yH/GlQpKZbU1BvFFqOjhISRo1MNx1tWYsYvmj6KIRHSPMT2+yHOEb1SG6NMvRoHRF0a07kCOox/9yakl1vg==",
++      "license": "MIT",
++      "dependencies": {
++        "@pinojs/redact": "^0.4.0",
++        "atomic-sleep": "^1.0.0",
++        "on-exit-leak-free": "^2.1.0",
++        "pino-abstract-transport": "^3.0.0",
++        "pino-std-serializers": "^7.0.0",
++        "process-warning": "^5.0.0",
++        "quick-format-unescaped": "^4.0.3",
++        "real-require": "^0.2.0",
++        "safe-stable-stringify": "^2.3.1",
++        "sonic-boom": "^4.0.1",
++        "thread-stream": "^4.0.0"
++      },
++      "bin": {
++        "pino": "bin.js"
++      }
++    },
++    "node_modules/pino-abstract-transport": {
++      "version": "3.0.0",
++      "resolved": "https://registry.npmjs.org/pino-abstract-transport/-/pino-abstract-transport-3.0.0.tgz",
++      "integrity": "sha512-wlfUczU+n7Hy/Ha5j9a/gZNy7We5+cXp8YL+X+PG8S0KXxw7n/JXA3c46Y0zQznIJ83URJiwy7Lh56WLokNuxg==",
++      "license": "MIT",
++      "dependencies": {
++        "split2": "^4.0.0"
++      }
++    },
++    "node_modules/pino-std-serializers": {
++      "version": "7.1.0",
++      "resolved": "https://registry.npmjs.org/pino-std-serializers/-/pino-std-serializers-7.1.0.tgz",
++      "integrity": "sha512-BndPH67/JxGExRgiX1dX0w1FvZck5Wa4aal9198SrRhZjH3GxKQUKIBnYJTdj2HDN3UQAS06HlfcSbQj2OHmaw==",
++      "license": "MIT"
++    },
++    "node_modules/postcss": {
++      "version": "8.5.28",
++      "resolved": "https://registry.npmjs.org/postcss/-/postcss-8.5.28.tgz",
++      "integrity": "sha512-RRuzqDtt5Y9h3quz5hWhK+TPnsmVs6WwSU6LkJMeY4HstUEDuYTG8UJSdawMRzmzAtV+KEoG8N3Qg2qLy5vM/A==",
++      "dev": true,
++      "funding": [
++        {
++          "type": "opencollective",
++          "url": "https://opencollective.com/postcss/"
++        },
++        {
++          "type": "tidelift",
++          "url": "https://tidelift.com/funding/github/npm/postcss"
++        },
++        {
++          "type": "github",
++          "url": "https://github.com/sponsors/ai"
++        }
++      ],
++      "license": "MIT",
++      "peer": true,
++      "dependencies": {
++        "nanoid": "^3.3.18",
++        "picocolors": "^1.1.1",
++        "source-map-js": "^1.2.1"
++      },
++      "engines": {
++        "node": "^10 || ^12 || >=14"
++      }
++    },
++    "node_modules/process-warning": {
++      "version": "5.1.0",
++      "resolved": "https://registry.npmjs.org/process-warning/-/process-warning-5.1.0.tgz",
++      "integrity": "sha512-jQSaVHsPgtyw60e1rQ/A+/ArPEj/S8pS/vFnyGa/gYFXrKk/6RuDkoqVDQ5NI5MmS01698ltlAk0NoDBNLujRw==",
++      "funding": [
++        {
++          "type": "github",
++          "url": "https://github.com/sponsors/fastify"
++        },
++        {
++          "type": "opencollective",
++          "url": "https://opencollective.com/fastify"
++        }
++      ],
++      "license": "MIT"
++    },
++    "node_modules/quick-format-unescaped": {
++      "version": "4.0.4",
++      "resolved": "https://registry.npmjs.org/quick-format-unescaped/-/quick-format-unescaped-4.0.4.tgz",
++      "integrity": "sha512-tYC1Q1hgyRuHgloV/YXs2w15unPVh8qfu/qCTfhTYamaw7fyhumKa2yGpdSo87vY32rIclj+4fWYQXUMs9EHvg==",
++      "license": "MIT"
++    },
++    "node_modules/real-require": {
++      "version": "0.2.0",
++      "resolved": "https://registry.npmjs.org/real-require/-/real-require-0.2.0.tgz",
++      "integrity": "sha512-57frrGM/OCTLqLOAh0mhVA9VBMHd+9U7Zb2THMGdBUoZVOtGbJzjxsYGDJ3A9AYYCP4hn6y1TVbaOfzWtm5GFg==",
++      "license": "MIT",
++      "engines": {
++        "node": ">= 12.13.0"
++      }
++    },
++    "node_modules/require-from-string": {
++      "version": "2.0.2",
++      "resolved": "https://registry.npmjs.org/require-from-string/-/require-from-string-2.0.2.tgz",
++      "integrity": "sha512-Xf0nWe6RseziFMu+Ap9biiUbmplq6S9/p+7w7YXP/JBHhrUDDUhwa+vANyubuqfZWTveU//DYVGsDG7RKL/vEw==",
++      "license": "MIT",
++      "engines": {
++        "node": ">=0.10.0"
++      }
++    },
++    "node_modules/ret": {
++      "version": "0.5.0",
++      "resolved": "https://registry.npmjs.org/ret/-/ret-0.5.0.tgz",
++      "integrity": "sha512-I1XxrZSQ+oErkRR4jYbAyEEu2I0avBvvMM5JN+6EBprOGRCs63ENqZ3vjavq8fBw2+62G5LF5XelKwuJpcvcxw==",
++      "license": "MIT",
++      "engines": {
++        "node": ">=10"
++      }
++    },
++    "node_modules/reusify": {
++      "version": "1.1.0",
++      "resolved": "https://registry.npmjs.org/reusify/-/reusify-1.1.0.tgz",
++      "integrity": "sha512-g6QUff04oZpHs0eG5p83rFLhHeV00ug/Yf9nZM6fLeUrPguBTkTQOdpAWWspMh55TZfVQDPaN3NQJfbVRAxdIw==",
++      "license": "MIT",
++      "engines": {
++        "iojs": ">=1.0.0",
++        "node": ">=0.10.0"
++      }
++    },
++    "node_modules/rfdc": {
++      "version": "1.4.1",
++      "resolved": "https://registry.npmjs.org/rfdc/-/rfdc-1.4.1.tgz",
++      "integrity": "sha512-q1b3N5QkRUWUl7iyylaaj3kOpIT0N2i9MqIEQXP73GVsN9cw3fdx8X63cEmWhJGi2PPCF23Ijp7ktmd39rawIA==",
++      "license": "MIT"
++    },
++    "node_modules/rolldown": {
++      "version": "1.2.12",
++      "resolved": "https://registry.npmjs.org/rolldown/-/rolldown-1.2.12.tgz",
++      "integrity": "sha512-8wafseiaG80xmXSfqidUNqZcylTlhmPZZt+za2m+js2sFZ8dTNlhIOV2WcbIPx2hgwPBJpEUGFAMZ9bgBBLTSQ==",
++      "dev": true,
++      "license": "MIT",
++      "peer": true,
++      "dependencies": {
++        "@oxc-project/types": "=0.152.0",
++        "@rolldown/pluginutils": "^1.0.0"
++      },
++      "bin": {
++        "rolldown": "bin/cli.mjs"
++      },
++      "engines": {
++        "node": "^20.19.0 || >=22.12.0"
++      },
++      "optionalDependencies": {
++        "@rolldown/binding-android-arm-eabi": "1.2.12",
++        "@rolldown/binding-android-arm64": "1.2.12",
++        "@rolldown/binding-darwin-arm64": "1.2.12",
++        "@rolldown/binding-darwin-x64": "1.2.12",
++        "@rolldown/binding-freebsd-x64": "1.2.12",
++        "@rolldown/binding-linux-arm-gnueabihf": "1.2.12",
++        "@rolldown/binding-linux-arm64-gnu": "1.2.12",
++        "@rolldown/binding-linux-arm64-musl": "1.2.12",
++        "@rolldown/binding-linux-ppc64-gnu": "1.2.12",
++        "@rolldown/binding-linux-s390x-gnu": "1.2.12",
++        "@rolldown/binding-linux-x64-gnu": "1.2.12",
++        "@rolldown/binding-linux-x64-musl": "1.2.12",
++        "@rolldown/binding-openharmony-arm64": "1.2.12",
++        "@rolldown/binding-win32-arm64-msvc": "1.2.12",
++        "@rolldown/binding-win32-x64-msvc": "1.2.12"
++      }
++    },
++    "node_modules/safe-regex2": {
++      "version": "5.1.1",
++      "resolved": "https://registry.npmjs.org/safe-regex2/-/safe-regex2-5.1.1.tgz",
++      "integrity": "sha512-mOSBvHGDZMuIEZMdOz/aCEYDCv0E7nfcNsIhUF+/P+xC7Hyf3FkvymqgPbg9D1EdSGu+uKbJgy09K/RKKc7kJA==",
++      "funding": [
++        {
++          "type": "github",
++          "url": "https://github.com/sponsors/fastify"
++        },
++        {
++          "type": "opencollective",
++          "url": "https://opencollective.com/fastify"
++        }
++      ],
++      "license": "MIT",
++      "dependencies": {
++        "ret": "~0.5.0"
++      },
++      "bin": {
++        "safe-regex2": "bin/safe-regex2.js"
++      }
++    },
++    "node_modules/safe-stable-stringify": {
++      "version": "2.5.0",
++      "resolved": "https://registry.npmjs.org/safe-stable-stringify/-/safe-stable-stringify-2.5.0.tgz",
++      "integrity": "sha512-b3rppTKm9T+PsVCBEOUR46GWI7fdOs00VKZ1+9c1EWDaDMvjQc6tUwuFyIprgGgTcWoVHSKrU8H31ZHA2e0RHA==",
++      "license": "MIT",
++      "engines": {
++        "node": ">=10"
++      }
++    },
++    "node_modules/secure-json-parse": {
++      "version": "4.1.0",
++      "resolved": "https://registry.npmjs.org/secure-json-parse/-/secure-json-parse-4.1.0.tgz",
++      "integrity": "sha512-l4KnYfEyqYJxDwlNVyRfO2E4NTHfMKAWdUuA8J0yve2Dz/E/PdBepY03RvyJpssIpRFwJoCD55wA+mEDs6ByWA==",
++      "funding": [
++        {
++          "type": "github",
++          "url": "https://github.com/sponsors/fastify"
++        },
++        {
++          "type": "opencollective",
++          "url": "https://opencollective.com/fastify"
++        }
++      ],
++      "license": "BSD-3-Clause"
++    },
++    "node_modules/semver": {
++      "version": "7.8.5",
++      "resolved": "https://registry.npmjs.org/semver/-/semver-7.8.5.tgz",
++      "integrity": "sha512-Y7/KDsb8LjooZpwaqGyulO6DQlksgCncchHGk+sZIY4SBvUocMBEFH5Ur1fI4dV+Jvl0w6cjvucaIi40puRioA==",
++      "license": "ISC",
++      "bin": {
++        "semver": "bin/semver.js"
++      },
++      "engines": {
++        "node": ">=10"
++      }
++    },
++    "node_modules/set-cookie-parser": {
++      "version": "2.7.2",
++      "resolved": "https://registry.npmjs.org/set-cookie-parser/-/set-cookie-parser-2.7.2.tgz",
++      "integrity": "sha512-oeM1lpU/UvhTxw+g3cIfxXHyJRc/uidd3yK1P242gzHds0udQBYzs3y8j4gCCW+ZJ7ad0yctld8RYO+bdurlvw==",
++      "license": "MIT"
++    },
++    "node_modules/sonic-boom": {
++      "version": "4.2.1",
++      "resolved": "https://registry.npmjs.org/sonic-boom/-/sonic-boom-4.2.1.tgz",
++      "integrity": "sha512-w6AxtubXa2wTXAUsZMMWERrsIRAdrK0Sc+FUytWvYAhBJLyuI4llrMIC1DtlNSdI99EI86KZum2MMq3EAZlF9Q==",
++      "license": "MIT",
++      "dependencies": {
++        "atomic-sleep": "^1.0.0"
++      }
++    },
++    "node_modules/source-map-js": {
++      "version": "1.2.2",
++      "resolved": "https://registry.npmjs.org/source-map-js/-/source-map-js-1.2.2.tgz",
++      "integrity": "sha512-KGj/8Y43x35aZVDtt+J4mK1hoLGHULMYfSkODJNQjNDC3oW1PqPoxMwo0pLUsWM/UEGzON/NxeHywEfNXNP3Vw==",
++      "dev": true,
++      "license": "BSD-3-Clause",
++      "peer": true,
++      "engines": {
++        "node": ">=0.10.0"
++      }
++    },
++    "node_modules/split2": {
++      "version": "4.2.0",
++      "resolved": "https://registry.npmjs.org/split2/-/split2-4.2.0.tgz",
++      "integrity": "sha512-UcjcJOWknrNkF6PLX83qcHM6KHgVKNkV62Y8a5uYDVv9ydGQVwAHMKqHdJje1VTWpljG0WYpCDhrCdAOYH4TWg==",
++      "license": "ISC",
++      "engines": {
++        "node": ">= 10.x"
++      }
++    },
++    "node_modules/std-env": {
++      "version": "4.3.0",
++      "resolved": "https://registry.npmjs.org/std-env/-/std-env-4.3.0.tgz",
++      "integrity": "sha512-OtU/EgQ1kIm5KwqQpBC6ZEMXrZRui11w8zgfTWp8cdO9B8OaPsbA8bTHO2P+HNo1VlUTGMVBwPhydu6poeXiag==",
++      "dev": true,
++      "license": "MIT"
++    },
++    "node_modules/thread-stream": {
++      "version": "4.2.0",
++      "resolved": "https://registry.npmjs.org/thread-stream/-/thread-stream-4.2.0.tgz",
++      "integrity": "sha512-e2zZ96wSChazBsbENf/Pcm/4swHt2cEKQ92rhUjkL9GCKiTDJIaTBenjE/m9DXi0QBmTMDkFDdOomUy20A1tDQ==",
++      "license": "MIT",
++      "dependencies": {
++        "real-require": "^1.0.0"
++      },
++      "engines": {
++        "node": ">=20"
++      }
++    },
++    "node_modules/thread-stream/node_modules/real-require": {
++      "version": "1.0.0",
++      "resolved": "https://registry.npmjs.org/real-require/-/real-require-1.0.0.tgz",
++      "integrity": "sha512-P4nbQYQfePJxRSmY+v/KINxVucm4NF3p3s7pJveMTtom52FR4YGltUQLB8idDXwDDWW+eYrWDFbuzUnjoWHF7g==",
++      "license": "MIT"
++    },
++    "node_modules/tinybench": {
++      "version": "6.2.0",
++      "resolved": "https://registry.npmjs.org/tinybench/-/tinybench-6.2.0.tgz",
++      "integrity": "sha512-78U2TlB2CnVenajOFzf3BKSm0J6oz5L0NV7g32LCPccvYc0lbWvys4d3uUUCS2B1N8PAf2+aekR8i1KbC3HO7Q==",
++      "dev": true,
++      "license": "MIT",
++      "engines": {
++        "node": ">=20.0.0"
++      }
++    },
++    "node_modules/tinyexec": {
++      "version": "1.3.1",
++      "resolved": "https://registry.npmjs.org/tinyexec/-/tinyexec-1.3.1.tgz",
++      "integrity": "sha512-GCvB3aoys96IuDFBMcTB46JOR6mdMtAToqwiW8JlWhsoh1mhHi/xn9ss/Dg7N555GiJyEt2qzoG/NHCwM6h1EA==",
++      "dev": true,
++      "license": "MIT",
++      "engines": {
++        "node": ">=18"
++      }
++    },
++    "node_modules/tinyglobby": {
++      "version": "0.2.17",
++      "resolved": "https://registry.npmjs.org/tinyglobby/-/tinyglobby-0.2.17.tgz",
++      "integrity": "sha512-wXR/dYpcqKmfWpEdZjiKJOwCNFndD0DMnrW/cYjVGttEkBfVgcLFHoNrlj47mjOVic9yyNu65alsgF4NQyTa2g==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "fdir": "^6.5.0",
++        "picomatch": "^4.0.4"
++      },
++      "engines": {
++        "node": ">=12.0.0"
++      },
++      "funding": {
++        "url": "https://github.com/sponsors/SuperchupuDev"
++      }
++    },
++    "node_modules/toad-cache": {
++      "version": "3.7.4",
++      "resolved": "https://registry.npmjs.org/toad-cache/-/toad-cache-3.7.4.tgz",
++      "integrity": "sha512-m1TdR/rvT7kgGJZhspNtXdsdYk0fddFpJJFlG5s+UkPFo6lkLoZ3YLOaovPYjq1R75NP5JfeTlSHaOsE09peCg==",
++      "license": "MIT",
++      "engines": {
++        "node": ">=20"
++      }
++    },
++    "node_modules/typescript": {
++      "version": "7.0.2",
++      "resolved": "https://registry.npmjs.org/typescript/-/typescript-7.0.2.tgz",
++      "integrity": "sha512-8FYau96o3NKOhbjKi/qNvG/W5jhzxkbdm5sj9AbZ/5T5sWqn3hJgLfGx27sRKZWTvyzCP8dLRBTf5tBTSRVUNA==",
++      "dev": true,
++      "license": "Apache-2.0",
++      "bin": {
++        "tsc": "bin/tsc"
++      },
++      "engines": {
++        "node": ">=16.20.0"
++      },
++      "optionalDependencies": {
++        "@typescript/typescript-aix-ppc64": "7.0.2",
++        "@typescript/typescript-darwin-arm64": "7.0.2",
++        "@typescript/typescript-darwin-x64": "7.0.2",
++        "@typescript/typescript-freebsd-arm64": "7.0.2",
++        "@typescript/typescript-freebsd-x64": "7.0.2",
++        "@typescript/typescript-linux-arm": "7.0.2",
++        "@typescript/typescript-linux-arm64": "7.0.2",
++        "@typescript/typescript-linux-loong64": "7.0.2",
++        "@typescript/typescript-linux-mips64el": "7.0.2",
++        "@typescript/typescript-linux-ppc64": "7.0.2",
++        "@typescript/typescript-linux-riscv64": "7.0.2",
++        "@typescript/typescript-linux-s390x": "7.0.2",
++        "@typescript/typescript-linux-x64": "7.0.2",
++        "@typescript/typescript-netbsd-arm64": "7.0.2",
++        "@typescript/typescript-netbsd-x64": "7.0.2",
++        "@typescript/typescript-openbsd-arm64": "7.0.2",
++        "@typescript/typescript-openbsd-x64": "7.0.2",
++        "@typescript/typescript-sunos-x64": "7.0.2",
++        "@typescript/typescript-win32-arm64": "7.0.2",
++        "@typescript/typescript-win32-x64": "7.0.2"
++      }
++    },
++    "node_modules/undici-types": {
++      "version": "6.21.0",
++      "resolved": "https://registry.npmjs.org/undici-types/-/undici-types-6.21.0.tgz",
++      "integrity": "sha512-iwDZqg0QAGrg9Rav5H4n0M64c3mkR59cJ6wQp+7C4nI0gsmExaedaYLNO44eT4AtBBwjbTiGPMlt2Md0T9H9JQ==",
++      "dev": true,
++      "license": "MIT"
++    },
++    "node_modules/vite": {
++      "version": "8.3.2",
++      "resolved": "https://registry.npmjs.org/vite/-/vite-8.3.2.tgz",
++      "integrity": "sha512-SQr1x6W5vVSbROg7vsyXIaxK9b0G7zsT68acdWWRmnBUsgDieLCRG+Rep9WdZgcposvv/GSnr4GUUBqB3vXq6w==",
++      "dev": true,
++      "license": "MIT",
++      "peer": true,
++      "dependencies": {
++        "lightningcss": "^1.33.0",
++        "picomatch": "^4.0.7",
++        "postcss": "^8.5.28",
++        "rolldown": "~1.2.11",
++        "tinyglobby": "^0.2.17"
++      },
++      "bin": {
++        "vite": "bin/vite.js"
++      },
++      "engines": {
++        "node": "^20.19.0 || >=22.12.0"
++      },
++      "funding": {
++        "url": "https://github.com/vitejs/vite?sponsor=1"
++      },
++      "optionalDependencies": {
++        "fsevents": "~2.3.3"
++      },
++      "peerDependencies": {
++        "@types/node": "^20.19.0 || >=22.12.0",
++        "@vitejs/devtools": "^0.7.1",
++        "esbuild": "^0.27.0 || ^0.28.0",
++        "jiti": ">=1.21.0",
++        "less": "^4.0.0",
++        "sass": "^1.70.0",
++        "sass-embedded": "^1.70.0",
++        "stylus": ">=0.54.8",
++        "sugarss": "^5.0.0",
++        "terser": "^5.16.0",
++        "tsx": "^4.8.1",
++        "yaml": "^2.4.2"
++      },
++      "peerDependenciesMeta": {
++        "@types/node": {
++          "optional": true
++        },
++        "@vitejs/devtools": {
++          "optional": true
++        },
++        "esbuild": {
++          "optional": true
++        },
++        "jiti": {
++          "optional": true
++        },
++        "less": {
++          "optional": true
++        },
++        "sass": {
++          "optional": true
++        },
++        "sass-embedded": {
++          "optional": true
++        },
++        "stylus": {
++          "optional": true
++        },
++        "sugarss": {
++          "optional": true
++        },
++        "terser": {
++          "optional": true
++        },
++        "tsx": {
++          "optional": true
++        },
++        "yaml": {
++          "optional": true
++        }
++      }
++    },
++    "node_modules/vitest": {
++      "version": "5.0.3",
++      "resolved": "https://registry.npmjs.org/vitest/-/vitest-5.0.3.tgz",
++      "integrity": "sha512-xMw97S3rjdtj5dkVat7jCsqWBpvchs3RlpQctUqwJD0KkERk40vz2fJ77lDwW/Vzh/pk18eItYAzkodhSes3jQ==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "@types/chai": "^5.2.2",
++        "@vitest/mocker": "5.0.3",
++        "chai": "^6.2.2",
++        "es-module-lexer": "^2.3.2",
++        "expect-type": "^1.4.0",
++        "magic-string": "^1.2.3",
++        "obug": "^2.1.4",
++        "picomatch": "^4.0.7",
++        "std-env": "^4.2.0",
++        "tinybench": "^6.1.4",
++        "tinyexec": "^1.3.0",
++        "tinyglobby": "^0.2.17",
++        "why-is-node-running": "3.2.1"
++      },
++      "bin": {
++        "vitest": "vitest.mjs"
++      },
++      "engines": {
++        "node": "^22.12.0 || ^24.0.0 || >=26.0.0"
++      },
++      "funding": {
++        "url": "https://opencollective.com/vitest"
++      },
++      "peerDependencies": {
++        "@edge-runtime/vm": "*",
++        "@opentelemetry/api": "^1.9.0",
++        "@types/node": "^22.0.0 || >=24.0.0",
++        "@vitest/browser-playwright": "5.0.3",
++        "@vitest/browser-preview": "5.0.3",
++        "@vitest/browser-webdriverio": "^5.0.0-beta.5 || >=5.0.0",
++        "@vitest/coverage-istanbul": "5.0.3",
++        "@vitest/coverage-v8": "5.0.3",
++        "@vitest/ui": "5.0.3",
++        "happy-dom": "*",
++        "jsdom": "*",
++        "vite": "^6.4.0 || ^7.0.0 || ^8.0.0"
++      },
++      "peerDependenciesMeta": {
++        "@edge-runtime/vm": {
++          "optional": true
++        },
++        "@opentelemetry/api": {
++          "optional": true
++        },
++        "@types/node": {
++          "optional": true
++        },
++        "@vitest/browser-playwright": {
++          "optional": true
++        },
++        "@vitest/browser-preview": {
++          "optional": true
++        },
++        "@vitest/browser-webdriverio": {
++          "optional": true
++        },
++        "@vitest/coverage-istanbul": {
++          "optional": true
++        },
++        "@vitest/coverage-v8": {
++          "optional": true
++        },
++        "@vitest/ui": {
++          "optional": true
++        },
++        "happy-dom": {
++          "optional": true
++        },
++        "jsdom": {
++          "optional": true
++        },
++        "vite": {
++          "optional": false
++        }
++      }
++    },
++    "node_modules/why-is-node-running": {
++      "version": "3.2.1",
++      "resolved": "https://registry.npmjs.org/why-is-node-running/-/why-is-node-running-3.2.1.tgz",
++      "integrity": "sha512-Tb2FUhB4vUsGQlfSquQLYkApkuPAFQXGFzxWKHHumVz2dK+X1RUm/HnID4+TfIGYJ1kTcwOaCk/buYCEJr6YjQ==",
++      "dev": true,
++      "license": "MIT",
++      "bin": {
++        "why-is-node-running": "cli.js"
++      },
++      "engines": {
++        "node": ">=20.11"
++      }
++    },
++    "node_modules/zod": {
++      "version": "4.6.5",
++      "resolved": "https://registry.npmjs.org/zod/-/zod-4.6.5.tgz",
++      "integrity": "sha512-v5l/aFXZQeai4awLbOpSoHecE9UiMrnfx75tEXLjNonXVARxQ5mOeipTjROUchszUNCqnE+hqAMujRsRHsut2Q==",
++      "license": "MIT",
++      "funding": {
++        "url": "https://github.com/sponsors/colinhacks"
++      }
++    }
++  }
++}
+
+===================================================================
+--- /dev/null
++++ b/package.json
+@@ -0,0 +1,26 @@
++{
++  "name": "url-shortener",
++  "version": "1.0.0",
++  "description": "URL shortener service with click analytics",
++  "private": true,
++  "type": "module",
++  "engines": {
++    "node": ">=22.18"
++  },
++  "scripts": {
++    "start": "node src/server.ts",
++    "dev": "node --watch src/server.ts",
++    "typecheck": "tsc --noEmit",
++    "test": "vitest run",
++    "verify": "npm run typecheck && npm test"
++  },
++  "dependencies": {
++    "fastify": "^5.12.5",
++    "zod": "^4.6.5"
++  },
++  "devDependencies": {
++    "@types/node": "^22.18.0",
++    "typescript": "^7.0.2",
++    "vitest": "^5.0.3"
++  }
++}
+
+===================================================================
+--- /dev/null
++++ b/src/analytics/clickRecorder.ts
+@@ -0,0 +1,113 @@
++import type { StatementSync } from 'node:sqlite';
++import { inTransaction, type Database } from '../db/database.ts';
++
++export interface ClickEvent {
++  code: string;
++  clickedAt: string;
++  referrerHost: string | null;
++}
++
++export interface ClickRecorderOptions {
++  flushIntervalMs: number;
++  /** Upper bound on buffered events. Beyond it, events are dropped so memory stays bounded under load. */
++  maxQueue: number;
++}
++
++/**
++ * Buffers click events in memory and writes them in batches.
++ *
++ * Redirects are the hot path and must not wait on an analytics write, so recording a click is an
++ * in-memory push. The cost is that analytics are best-effort: events can be dropped when the queue
++ * is full, and events still buffered when the process stops are lost.
++ */
++export class ClickRecorder {
++  private readonly db: Database;
++  private readonly options: ClickRecorderOptions;
++  private readonly insertEvent: StatementSync;
++  private readonly incrementCount: StatementSync;
++  private queue: ClickEvent[] = [];
++  private timer: NodeJS.Timeout | undefined;
++  private droppedCount = 0;
++
++  constructor(db: Database, options: ClickRecorderOptions) {
++    this.db = db;
++    this.options = options;
++    this.insertEvent = db.prepare(
++      'INSERT INTO click_events (code, clicked_at, referrer_host) VALUES (?, ?, ?)',
++    );
++    this.incrementCount = db.prepare('UPDATE links SET click_count = click_count + ? WHERE code = ?');
++  }
++
++  record(event: ClickEvent): void {
++    if (this.queue.length >= this.options.maxQueue) {
++      this.droppedCount++;
++      return;
++    }
++    this.queue.push(event);
++  }
++
++  /** Writes everything buffered in one transaction, so the events and the running totals cannot disagree. */
++  flush(): number {
++    if (this.queue.length === 0) return 0;
++    const batch = this.queue;
++    this.queue = [];
++
++    const perCode = new Map<string, number>();
++    try {
++      inTransaction(this.db, () => {
++        for (const event of batch) {
++          this.insertEvent.run(event.code, event.clickedAt, event.referrerHost);
++          perCode.set(event.code, (perCode.get(event.code) ?? 0) + 1);
++        }
++        for (const [code, count] of perCode) {
++          this.incrementCount.run(count, code);
++        }
++      });
++    } catch (error) {
++      // Put the batch back so a transient database error does not lose it, within the queue bound.
++      const room = Math.max(0, this.options.maxQueue - this.queue.length);
++      this.queue = batch.slice(0, room).concat(this.queue);
++      this.droppedCount += batch.length - Math.min(batch.length, room);
++      throw error;
++    }
++    return batch.length;
++  }
++
++  start(onError: (error: unknown) => void): void {
++    if (this.timer) return;
++    this.timer = setInterval(() => {
++      try {
++        this.flush();
++      } catch (error) {
++        onError(error);
++      }
++    }, this.options.flushIntervalMs);
++    // Do not keep the process alive just for the flush timer.
++    this.timer.unref();
++  }
++
++  stop(): void {
++    if (this.timer) {
++      clearInterval(this.timer);
++      this.timer = undefined;
++    }
++  }
++
++  get pending(): number {
++    return this.queue.length;
++  }
++
++  get dropped(): number {
++    return this.droppedCount;
++  }
++}
++
++/** Reduces a Referer header to its host. The full URL can carry personal data in its path or query. */
++export function referrerHost(header: string | undefined): string | null {
++  if (!header) return null;
++  try {
++    return new URL(header).hostname.toLowerCase() || null;
++  } catch {
++    return null;
++  }
++}
+
+===================================================================
+--- /dev/null
++++ b/src/analytics/statsService.ts
+@@ -0,0 +1,70 @@
++import type { StatementSync } from 'node:sqlite';
++import type { Database } from '../db/database.ts';
++import type { ClickRecorder } from './clickRecorder.ts';
++
++export interface LinkStats {
++  code: string;
++  totalClicks: number;
++  /** One entry per UTC day that had clicks, within the reporting window, oldest first. */
++  clicksByDay: { date: string; clicks: number }[];
++  /** Most common referring hosts. Clicks without a referrer are reported as "direct". */
++  topReferrers: { referrer: string; clicks: number }[];
++}
++
++export const STATS_WINDOW_DAYS = 30;
++export const TOP_REFERRERS_LIMIT = 10;
++
++export class StatsService {
++  private readonly recorder: ClickRecorder;
++  private readonly now: () => Date;
++  private readonly totalStatement: StatementSync;
++  private readonly byDayStatement: StatementSync;
++  private readonly referrersStatement: StatementSync;
++
++  constructor(db: Database, recorder: ClickRecorder, now: () => Date) {
++    this.recorder = recorder;
++    this.now = now;
++    this.totalStatement = db.prepare('SELECT click_count FROM links WHERE code = ?');
++    this.byDayStatement = db.prepare(`
++      SELECT substr(clicked_at, 1, 10) AS date, COUNT(*) AS clicks
++      FROM click_events
++      WHERE code = ? AND clicked_at >= ?
++      GROUP BY date
++      ORDER BY date
++    `);
++    this.referrersStatement = db.prepare(`
++      SELECT COALESCE(referrer_host, 'direct') AS referrer, COUNT(*) AS clicks
++      FROM click_events
++      WHERE code = ?
++      GROUP BY referrer
++      ORDER BY clicks DESC, referrer ASC
++      LIMIT ?
++    `);
++  }
++
++  /** Returns undefined when the link does not exist. */
++  getStats(code: string): LinkStats | undefined {
++    // Flush first so a caller sees the clicks this instance has already accepted.
++    this.recorder.flush();
++
++    const total = this.totalStatement.get(code) as { click_count: number } | undefined;
++    if (!total) return undefined;
++
++    const windowStart = new Date(this.now().getTime() - STATS_WINDOW_DAYS * 24 * 60 * 60 * 1000);
++    const clicksByDay = this.byDayStatement.all(code, windowStart.toISOString()) as {
++      date: string;
++      clicks: number;
++    }[];
++    const topReferrers = this.referrersStatement.all(code, TOP_REFERRERS_LIMIT) as {
++      referrer: string;
++      clicks: number;
++    }[];
++
++    return {
++      code,
++      totalClicks: total.click_count,
++      clicksByDay: clicksByDay.map((row) => ({ date: row.date, clicks: row.clicks })),
++      topReferrers: topReferrers.map((row) => ({ referrer: row.referrer, clicks: row.clicks })),
++    };
++  }
++}
+
+===================================================================
+--- /dev/null
++++ b/src/app.ts
+@@ -0,0 +1,80 @@
++import Fastify, { type FastifyInstance } from 'fastify';
++import { ClickRecorder } from './analytics/clickRecorder.ts';
++import { StatsService } from './analytics/statsService.ts';
++import type { Config } from './config.ts';
++import type { Database } from './db/database.ts';
++import { rateLimited } from './domain/errors.ts';
++import { errorHandler, notFoundHandler } from './http/problem.ts';
++import { TokenBucketLimiter } from './http/rateLimiter.ts';
++import { registerRoutes } from './http/routes.ts';
++import { LinkRepository } from './links/linkRepository.ts';
++import { LinkService } from './links/linkService.ts';
++
++export interface AppOptions {
++  config: Config;
++  db: Database;
++  /** Injectable clock and code generator, so tests control time and force code collisions. */
++  now?: () => Date;
++  generateCode?: () => string;
++}
++
++/**
++ * Wires the service together. Everything the app needs is passed in, which is what lets the
++ * integration tests run the whole HTTP stack against an in-memory database with no network.
++ */
++export function buildApp(options: AppOptions): FastifyInstance {
++  const { config, db } = options;
++  const now = options.now ?? (() => new Date());
++
++  const app = Fastify({
++    logger: {
++      level: config.logLevel,
++      // Log the method and path only. The default serializer also logs the client address.
++      serializers: {
++        req: (request) => ({ method: request.method, path: request.url.split('?')[0] }),
++      },
++    },
++    bodyLimit: 16 * 1024,
++    trustProxy: config.trustProxy,
++  });
++
++  const links = new LinkService(new LinkRepository(db), {
++    publicBaseUrl: config.publicBaseUrl,
++    now,
++    ...(options.generateCode ? { generateCode: options.generateCode } : {}),
++  });
++  const recorder = new ClickRecorder(db, {
++    flushIntervalMs: config.clicks.flushIntervalMs,
++    maxQueue: config.clicks.queueMax,
++  });
++  const stats = new StatsService(db, recorder, now);
++  const limiter = new TokenBucketLimiter({
++    capacity: config.rateLimit.capacity,
++    refillPerSecond: config.rateLimit.refillPerSecond,
++    now: () => now().getTime(),
++  });
++
++  app.setErrorHandler(errorHandler);
++  app.setNotFoundHandler(notFoundHandler);
++
++  // Limit the management API per client. Redirects are left unlimited: they are the product's hot
++  // path and are cheap, while link creation is the abusable write.
++  app.addHook('onRequest', async (request) => {
++    if (!request.url.startsWith('/api/')) return;
++    const decision = limiter.take(request.ip);
++    if (!decision.allowed) throw rateLimited(decision.retryAfterSeconds);
++  });
++
++  app.addHook('onSend', async (_request, reply) => {
++    reply.header('x-content-type-options', 'nosniff');
++  });
++
++  registerRoutes(app, { db, links, stats, recorder, now });
++
++  recorder.start((error) => app.log.error({ err: error }, 'click flush failed'));
++  app.addHook('onClose', async () => {
++    recorder.stop();
++  });
++
++  return app;
++}
+
+===================================================================
+--- /dev/null
++++ b/src/config.ts
+@@ -0,0 +1,52 @@
++import { z } from 'zod';
++
++/**
++ * All runtime configuration comes from environment variables and is validated once at startup,
++ * so a bad value fails the process immediately instead of surfacing as a runtime error later.
++ */
++const configSchema = z.object({
++  HOST: z.string().default('127.0.0.1'),
++  PORT: z.coerce.number().int().min(0).max(65535).default(3000),
++  /** Base URL used to build the short links returned to clients. */
++  PUBLIC_BASE_URL: z.url().default('http://localhost:3000'),
++  DATABASE_PATH: z.string().min(1).default('./data/shortener.db'),
++  /** Set only when running behind a trusted reverse proxy, so the client IP comes from X-Forwarded-For. */
++  TRUST_PROXY: z.enum(['true', 'false']).default('false'),
++  /** Token bucket for the management API: burst size and sustained rate per client. */
++  RATE_LIMIT_CAPACITY: z.coerce.number().int().positive().default(20),
++  RATE_LIMIT_REFILL_PER_SECOND: z.coerce.number().positive().default(1),
++  /** Click events are buffered in memory and written in batches. */
++  CLICK_FLUSH_INTERVAL_MS: z.coerce.number().int().positive().default(1000),
++  CLICK_QUEUE_MAX: z.coerce.number().int().positive().default(10_000),
++  LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent']).default('info'),
++});
++
++export interface Config {
++  host: string;
++  port: number;
++  publicBaseUrl: string;
++  databasePath: string;
++  trustProxy: boolean;
++  rateLimit: { capacity: number; refillPerSecond: number };
++  clicks: { flushIntervalMs: number; queueMax: number };
++  logLevel: string;
++}
++
++export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
++  const parsed = configSchema.safeParse(env);
++  if (!parsed.success) {
++    const problems = parsed.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`).join('; ');
++    throw new Error(`Invalid configuration: ${problems}`);
++  }
++  const e = parsed.data;
++  return {
++    host: e.HOST,
++    port: e.PORT,
++    publicBaseUrl: e.PUBLIC_BASE_URL.replace(/\/+$/, ''),
++    databasePath: e.DATABASE_PATH,
++    trustProxy: e.TRUST_PROXY === 'true',
++    rateLimit: { capacity: e.RATE_LIMIT_CAPACITY, refillPerSecond: e.RATE_LIMIT_REFILL_PER_SECOND },
++    clicks: { flushIntervalMs: e.CLICK_FLUSH_INTERVAL_MS, queueMax: e.CLICK_QUEUE_MAX },
++    logLevel: e.LOG_LEVEL,
++  };
++}
+
+===================================================================
+--- /dev/null
++++ b/src/db/database.ts
+@@ -0,0 +1,35 @@
++import { mkdirSync } from 'node:fs';
++import { dirname } from 'node:path';
++import { DatabaseSync } from 'node:sqlite';
++
++export type Database = DatabaseSync;
++
++/**
++ * Opens the SQLite database. All SQL lives behind the repository classes, so replacing SQLite
++ * with a networked database means rewriting those classes, not the HTTP or domain layers.
++ */
++export function openDatabase(path: string): Database {
++  if (path !== ':memory:') {
++    mkdirSync(dirname(path), { recursive: true });
++  }
++  const db = new DatabaseSync(path);
++  // WAL lets readers proceed while a write is in flight; busy_timeout waits instead of failing on a lock.
++  db.exec('PRAGMA journal_mode = WAL');
++  db.exec('PRAGMA synchronous = NORMAL');
++  db.exec('PRAGMA foreign_keys = ON');
++  db.exec('PRAGMA busy_timeout = 5000');
++  return db;
++}
++
++/** Runs `work` in a transaction and rolls back if it throws. */
++export function inTransaction<T>(db: Database, work: () => T): T {
++  db.exec('BEGIN IMMEDIATE');
++  try {
++    const result = work();
++    db.exec('COMMIT');
++    return result;
++  } catch (error) {
++    db.exec('ROLLBACK');
++    throw error;
++  }
++}
+
+===================================================================
+--- /dev/null
++++ b/src/db/migrator.ts
+@@ -0,0 +1,59 @@
++import { createHash } from 'node:crypto';
++import { readdirSync, readFileSync } from 'node:fs';
++import { join } from 'node:path';
++import { inTransaction, type Database } from './database.ts';
++
++export interface MigrationResult {
++  applied: string[];
++  alreadyApplied: string[];
++}
++
++const MIGRATION_FILE = /^(\d{3})_[a-z0-9_]+\.sql$/;
++
++/**
++ * Applies `NNN_name.sql` files in order, each in its own transaction.
++ * A migration that has already run must never change: its checksum is stored, and a mismatch
++ * stops startup rather than letting the schema drift from what the files describe.
++ */
++export function migrate(db: Database, migrationsDir: string): MigrationResult {
++  db.exec(`
++    CREATE TABLE IF NOT EXISTS schema_migrations (
++      version    TEXT PRIMARY KEY,
++      checksum   TEXT NOT NULL,
++      applied_at TEXT NOT NULL
++    ) STRICT
++  `);
++
++  const files = readdirSync(migrationsDir)
++    .filter((name) => MIGRATION_FILE.test(name))
++    .sort();
++
++  const findApplied = db.prepare('SELECT checksum FROM schema_migrations WHERE version = ?');
++  const recordApplied = db.prepare(
++    'INSERT INTO schema_migrations (version, checksum, applied_at) VALUES (?, ?, ?)',
++  );
++
++  const result: MigrationResult = { applied: [], alreadyApplied: [] };
++  for (const file of files) {
++    const sql = readFileSync(join(migrationsDir, file), 'utf8');
++    const checksum = createHash('sha256').update(sql).digest('hex');
++    const existing = findApplied.get(file) as { checksum: string } | undefined;
++
++    if (existing) {
++      if (existing.checksum !== checksum) {
++        throw new Error(
++          `Migration ${file} was modified after it was applied. Add a new migration instead of editing an old one.`,
++        );
++      }
++      result.alreadyApplied.push(file);
++      continue;
++    }
++
++    inTransaction(db, () => {
++      db.exec(sql);
++      recordApplied.run(file, checksum, new Date().toISOString());
++    });
++    result.applied.push(file);
++  }
++  return result;
++}
+
+===================================================================
+--- /dev/null
++++ b/src/domain/errors.ts
+@@ -0,0 +1,34 @@
++/**
++ * Errors the service raises on purpose. Each one maps to an HTTP status and a stable machine-readable
++ * `code`, and is rendered as an RFC 9457 problem document by the HTTP layer.
++ */
++export class AppError extends Error {
++  readonly status: number;
++  readonly code: string;
++  readonly headers: Record<string, string>;
++
++  constructor(status: number, code: string, message: string, headers: Record<string, string> = {}) {
++    super(message);
++    this.name = 'AppError';
++    this.status = status;
++    this.code = code;
++    this.headers = headers;
++  }
++}
++
++export const validationError = (message: string): AppError =>
++  new AppError(400, 'validation_error', message);
++
++export const linkNotFound = (code: string): AppError =>
++  new AppError(404, 'link_not_found', `No link exists for code "${code}".`);
++
++export const aliasTaken = (alias: string): AppError =>
++  new AppError(409, 'alias_taken', `The alias "${alias}" is already in use.`);
++
++export const rateLimited = (retryAfterSeconds: number): AppError =>
++  new AppError(429, 'rate_limited', 'Too many requests. Retry later.', {
++    'retry-after': String(retryAfterSeconds),
++  });
++
++export const codeSpaceExhausted = (): AppError =>
++  new AppError(503, 'code_generation_failed', 'Could not allocate a unique short code. Retry.');
+
+===================================================================
+--- /dev/null
++++ b/src/domain/shortCode.ts
+@@ -0,0 +1,39 @@
++import { randomInt } from 'node:crypto';
++import { validationError } from './errors.ts';
++
++const ALPHABET = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
++
++/** 62^7 is about 3.5 trillion codes, so random codes are impractical to enumerate. */
++export const CODE_LENGTH = 7;
++
++/** Matches both generated codes and custom aliases; used to reject junk before touching the database. */
++export const CODE_PATTERN = /^[A-Za-z0-9_-]{3,32}$/;
++
++/** Custom aliases are lowercase only, so "Promo" and "promo" can never be two different links. */
++const ALIAS_PATTERN = /^[a-z0-9][a-z0-9_-]{2,31}$/;
++
++/** Path segments the service uses itself; an alias must not shadow them. */
++const RESERVED_ALIASES = new Set(['api', 'healthz', 'readyz', 'docs', 'admin', 'static', 'assets']);
++
++export type RandomInt = (maxExclusive: number) => number;
++
++/** Generates a random code from a cryptographically secure source, so codes are not guessable in sequence. */
++export function generateCode(length: number = CODE_LENGTH, random: RandomInt = randomInt): string {
++  let code = '';
++  for (let i = 0; i < length; i++) {
++    code += ALPHABET[random(ALPHABET.length)];
++  }
++  return code;
++}
++
++export function validateAlias(alias: string): string {
++  if (!ALIAS_PATTERN.test(alias)) {
++    throw validationError(
++      'alias must be 3-32 characters of lowercase letters, digits, "-" or "_", and start with a letter or digit.',
++    );
++  }
++  if (RESERVED_ALIASES.has(alias)) {
++    throw validationError(`alias "${alias}" is reserved.`);
++  }
++  return alias;
++}
+
+===================================================================
+--- /dev/null
++++ b/src/domain/urlPolicy.ts
+@@ -0,0 +1,39 @@
++import { validationError } from './errors.ts';
++
++export const MAX_URL_LENGTH = 2048;
++
++export interface UrlPolicyOptions {
++  /** Host of this service. Links pointing back at it are rejected to prevent redirect loops. */
++  selfHost: string;
++}
++
++/**
++ * Validates a destination URL and returns its normalized form.
++ * A shortener is an open redirector by design, so the rules here decide what it may redirect to.
++ */
++export function normalizeTargetUrl(input: string, options: UrlPolicyOptions): string {
++  if (input.length > MAX_URL_LENGTH) {
++    throw validationError(`url must be at most ${MAX_URL_LENGTH} characters.`);
++  }
++
++  let url: URL;
++  try {
++    url = new URL(input);
++  } catch {
++    throw validationError('url must be an absolute URL.');
++  }
++
++  // Only web links. This rejects javascript:, data:, file: and similar schemes that run or expose content.
++  if (url.protocol !== 'http:' && url.protocol !== 'https:') {
++    throw validationError('url must use http or https.');
++  }
++  // user:pass@host is a classic way to disguise the real destination.
++  if (url.username !== '' || url.password !== '') {
++    throw validationError('url must not contain credentials.');
++  }
++  if (url.host.toLowerCase() === options.selfHost.toLowerCase()) {
++    throw validationError('url must not point at this service.');
++  }
++
++  return url.toString();
++}
+
+===================================================================
+--- /dev/null
++++ b/src/http/problem.ts
+@@ -0,0 +1,59 @@
++import type { FastifyError, FastifyReply, FastifyRequest } from 'fastify';
++import { AppError } from '../domain/errors.ts';
++
++/** RFC 9457 problem document. `code` is the stable identifier clients should branch on. */
++export interface Problem {
++  type: string;
++  title: string;
++  status: number;
++  code: string;
++  detail: string;
++}
++
++const TITLES: Record<number, string> = {
++  400: 'Bad Request',
++  404: 'Not Found',
++  409: 'Conflict',
++  410: 'Gone',
++  413: 'Payload Too Large',
++  415: 'Unsupported Media Type',
++  429: 'Too Many Requests',
++  500: 'Internal Server Error',
++  503: 'Service Unavailable',
++};
++
++export function problem(status: number, code: string, detail: string): Problem {
++  return { type: `urn:problem:${code}`, title: TITLES[status] ?? 'Error', status, code, detail };
++}
++
++function send(reply: FastifyReply, body: Problem, headers: Record<string, string> = {}): FastifyReply {
++  return reply
++    .code(body.status)
++    .headers(headers)
++    .header('content-type', 'application/problem+json; charset=utf-8')
++    .send(JSON.stringify(body));
++}
++
++export function errorHandler(
++  error: FastifyError | AppError | Error,
++  request: FastifyRequest,
++  reply: FastifyReply,
++): FastifyReply {
++  if (error instanceof AppError) {
++    return send(reply, problem(error.status, error.code, error.message), error.headers);
++  }
++
++  // Errors Fastify raises for malformed requests (bad JSON, oversized body) carry a 4xx status.
++  const status = 'statusCode' in error ? error.statusCode : undefined;
++  if (typeof status === 'number' && status >= 400 && status < 500) {
++    return send(reply, problem(status, 'bad_request', error.message));
++  }
++
++  // Anything else is a bug or an outage. Log the detail, return none of it.
++  request.log.error({ err: error }, 'unhandled error');
++  return send(reply, problem(500, 'internal_error', 'An unexpected error occurred.'));
++}
++
++export function notFoundHandler(request: FastifyRequest, reply: FastifyReply): FastifyReply {
++  return send(reply, problem(404, 'not_found', `No route for ${request.method} ${request.url.split('?')[0]}.`));
++}
+
+===================================================================
+--- /dev/null
++++ b/src/http/rateLimiter.ts
+@@ -0,0 +1,73 @@
++export interface RateLimiterOptions {
++  /** Maximum burst: how many requests a client can make at once. */
++  capacity: number;
++  /** Sustained rate at which the allowance refills. */
++  refillPerSecond: number;
++  /** Bound on tracked clients, so a flood of distinct keys cannot exhaust memory. */
++  maxKeys?: number;
++  now?: () => number;
++}
++
++export interface RateLimitDecision {
++  allowed: boolean;
++  /** Seconds until one request is available again; 0 when allowed. */
++  retryAfterSeconds: number;
++}
++
++interface Bucket {
++  tokens: number;
++  updatedAt: number;
++}
++
++/**
++ * In-memory token bucket per client key.
++ * State is local to one process: with several instances each one enforces its own limit.
++ */
++export class TokenBucketLimiter {
++  private readonly capacity: number;
++  private readonly refillPerMs: number;
++  private readonly maxKeys: number;
++  private readonly now: () => number;
++  private readonly buckets = new Map<string, Bucket>();
++
++  constructor(options: RateLimiterOptions) {
++    this.capacity = options.capacity;
++    this.refillPerMs = options.refillPerSecond / 1000;
++    this.maxKeys = options.maxKeys ?? 10_000;
++    this.now = options.now ?? Date.now;
++  }
++
++  take(key: string): RateLimitDecision {
++    const now = this.now();
++    const existing = this.buckets.get(key);
++    const bucket: Bucket = existing ?? { tokens: this.capacity, updatedAt: now };
++
++    const elapsed = Math.max(0, now - bucket.updatedAt);
++    bucket.tokens = Math.min(this.capacity, bucket.tokens + elapsed * this.refillPerMs);
++    bucket.updatedAt = now;
++
++    // Re-insert so the Map's insertion order doubles as least-recently-used order.
++    this.buckets.delete(key);
++    this.buckets.set(key, bucket);
++    this.evictIfNeeded();
++
++    if (bucket.tokens >= 1) {
++      bucket.tokens -= 1;
++      return { allowed: true, retryAfterSeconds: 0 };
++    }
++    const msUntilToken = (1 - bucket.tokens) / this.refillPerMs;
++    return { allowed: false, retryAfterSeconds: Math.max(1, Math.ceil(msUntilToken / 1000)) };
++  }
++
++  get trackedKeys(): number {
++    return this.buckets.size;
++  }
++
++  private evictIfNeeded(): void {
++    while (this.buckets.size > this.maxKeys) {
++      const oldest = this.buckets.keys().next().value;
++      if (oldest === undefined) return;
++      this.buckets.delete(oldest);
++    }
++  }
++}
+
+===================================================================
+--- /dev/null
++++ b/src/http/routes.ts
+@@ -0,0 +1,96 @@
++import type { FastifyInstance } from 'fastify';
++import { z } from 'zod';
++import { referrerHost, type ClickRecorder } from '../analytics/clickRecorder.ts';
++import type { StatsService } from '../analytics/statsService.ts';
++import type { Database } from '../db/database.ts';
++import { linkNotFound, validationError } from '../domain/errors.ts';
++import { CODE_PATTERN } from '../domain/shortCode.ts';
++import type { LinkService } from '../links/linkService.ts';
++
++export interface RouteDependencies {
++  db: Database;
++  links: LinkService;
++  stats: StatsService;
++  recorder: ClickRecorder;
++  now: () => Date;
++}
++
++const createLinkBody = z.strictObject({
++  url: z.string().min(1),
++  alias: z.string().optional(),
++});
++
++function parseBody<T>(schema: z.ZodType<T>, body: unknown): T {
++  const result = schema.safeParse(body);
++  if (!result.success) {
++    const detail = result.error.issues
++      .map((issue) => `${issue.path.join('.') || 'body'}: ${issue.message}`)
++      .join('; ');
++    throw validationError(detail);
++  }
++  return result.data;
++}
++
++/** Rejects malformed codes before they reach the database, and treats them as unknown links. */
++function codeParam(params: unknown): string {
++  const code = (params as { code?: string }).code ?? '';
++  if (!CODE_PATTERN.test(code)) throw linkNotFound(code);
++  return code;
++}
++
++export function registerRoutes(app: FastifyInstance, deps: RouteDependencies): void {
++  const { db, links, stats, recorder, now } = deps;
++
++  app.post('/api/v1/links', async (request, reply) => {
++    const body = parseBody(createLinkBody, request.body);
++    const link = links.create(body);
++    return reply.code(201).header('location', `/api/v1/links/${link.code}`).send(link);
++  });
++
++  app.get('/api/v1/links/:code', async (request) => {
++    const record = links.get(codeParam(request.params));
++    return {
++      code: record.code,
++      shortUrl: links.shortUrlFor(record.code),
++      targetUrl: record.targetUrl,
++      createdAt: record.createdAt,
++    };
++  });
++
++  app.get('/api/v1/links/:code/stats', async (request) => {
++    const code = codeParam(request.params);
++    const result = stats.getStats(code);
++    if (!result) throw linkNotFound(code);
++    return result;
++  });
++
++  app.get('/:code', async (request, reply) => {
++    const code = codeParam(request.params);
++    const record = links.get(code);
++    recorder.record({
++      code,
++      clickedAt: now().toISOString(),
++      referrerHost: referrerHost(request.headers.referer),
++    });
++    // 302 with no-store: browsers must ask every time, so each click is counted and a link can change later.
++    return reply
++      .code(302)
++      .header('location', record.targetUrl)
++      .header('cache-control', 'no-store')
++      .header('referrer-policy', 'no-referrer')
++      .send();
++  });
++
++  /** Liveness: the process is up. */
++  app.get('/healthz', async () => ({ status: 'ok' }));
++
++  /** Readiness: the process can serve traffic, which requires the database. */
++  app.get('/readyz', async (_request, reply) => {
++    try {
++      db.prepare('SELECT 1').get();
++      return { status: 'ready' };
++    } catch {
++      return reply.code(503).send({ status: 'unavailable' });
++    }
++  });
++}
+
+===================================================================
+--- /dev/null
++++ b/src/links/linkRepository.ts
+@@ -0,0 +1,48 @@
++import type { StatementSync } from 'node:sqlite';
++import type { Database } from '../db/database.ts';
++
++export interface LinkRecord {
++  code: string;
++  targetUrl: string;
++  createdAt: string;
++  clickCount: number;
++}
++
++interface LinkRow {
++  code: string;
++  target_url: string;
++  created_at: string;
++  click_count: number;
++}
++
++/** The only place that knows how links are stored. Every statement is parameterized. */
++export class LinkRepository {
++  private readonly insertStatement: StatementSync;
++  private readonly findStatement: StatementSync;
++
++  constructor(db: Database) {
++    this.insertStatement = db.prepare(
++      'INSERT INTO links (code, target_url, created_at) VALUES (?, ?, ?) ON CONFLICT (code) DO NOTHING',
++    );
++    this.findStatement = db.prepare(
++      'SELECT code, target_url, created_at, click_count FROM links WHERE code = ?',
++    );
++  }
++
++  /** Inserts the link. Returns false if the code is already taken, so the caller decides what a clash means. */
++  insert(link: { code: string; targetUrl: string; createdAt: string }): boolean {
++    const result = this.insertStatement.run(link.code, link.targetUrl, link.createdAt);
++    return Number(result.changes) === 1;
++  }
++
++  findByCode(code: string): LinkRecord | undefined {
++    const row = this.findStatement.get(code) as LinkRow | undefined;
++    if (!row) return undefined;
++    return {
++      code: row.code,
++      targetUrl: row.target_url,
++      createdAt: row.created_at,
++      clickCount: row.click_count,
++    };
++  }
++}
+
+===================================================================
+--- /dev/null
++++ b/src/links/linkService.ts
+@@ -0,0 +1,79 @@
++import { aliasTaken, codeSpaceExhausted, linkNotFound } from '../domain/errors.ts';
++import { generateCode, validateAlias } from '../domain/shortCode.ts';
++import { normalizeTargetUrl } from '../domain/urlPolicy.ts';
++import type { LinkRecord, LinkRepository } from './linkRepository.ts';
++
++export interface CreateLinkInput {
++  url: string;
++  alias?: string | undefined;
++}
++
++export interface Link {
++  code: string;
++  shortUrl: string;
++  targetUrl: string;
++  createdAt: string;
++}
++
++export interface LinkServiceOptions {
++  publicBaseUrl: string;
++  now: () => Date;
++  generateCode?: () => string;
++  /** How many random codes to try before giving up. A clash is rare, so repeated clashes signal a real problem. */
++  maxCodeAttempts?: number;
++}
++
++export class LinkService {
++  private readonly repository: LinkRepository;
++  private readonly publicBaseUrl: string;
++  private readonly selfHost: string;
++  private readonly now: () => Date;
++  private readonly generate: () => string;
++  private readonly maxCodeAttempts: number;
++
++  constructor(repository: LinkRepository, options: LinkServiceOptions) {
++    this.repository = repository;
++    this.publicBaseUrl = options.publicBaseUrl;
++    this.selfHost = new URL(options.publicBaseUrl).host;
++    this.now = options.now;
++    this.generate = options.generateCode ?? (() => generateCode());
++    this.maxCodeAttempts = options.maxCodeAttempts ?? 5;
++  }
++
++  create(input: CreateLinkInput): Link {
++    const targetUrl = normalizeTargetUrl(input.url, { selfHost: this.selfHost });
++    const createdAt = this.now().toISOString();
++
++    if (input.alias !== undefined) {
++      const alias = validateAlias(input.alias);
++      if (!this.repository.insert({ code: alias, targetUrl, createdAt })) {
++        throw aliasTaken(alias);
++      }
++      return this.toLink({ code: alias, targetUrl, createdAt });
++    }
++
++    // The primary key is the uniqueness check: insert and retry on a clash, with no read-then-write race.
++    for (let attempt = 0; attempt < this.maxCodeAttempts; attempt++) {
++      const code = this.generate();
++      if (this.repository.insert({ code, targetUrl, createdAt })) {
++        return this.toLink({ code, targetUrl, createdAt });
++      }
++    }
++    throw codeSpaceExhausted();
++  }
++
++  /** Returns the stored link or throws a 404 error. */
++  get(code: string): LinkRecord {
++    const record = this.repository.findByCode(code);
++    if (!record) throw linkNotFound(code);
++    return record;
++  }
++
++  shortUrlFor(code: string): string {
++    return `${this.publicBaseUrl}/${code}`;
++  }
++
++  private toLink(link: { code: string; targetUrl: string; createdAt: string }): Link {
++    return { ...link, shortUrl: this.shortUrlFor(link.code) };
++  }
++}
+
+===================================================================
+--- /dev/null
++++ b/src/server.ts
+@@ -0,0 +1,42 @@
++import { dirname, join } from 'node:path';
++import { fileURLToPath } from 'node:url';
++import { buildApp } from './app.ts';
++import { loadConfig } from './config.ts';
++import { openDatabase } from './db/database.ts';
++import { migrate } from './db/migrator.ts';
++
++const MIGRATIONS_DIR = join(dirname(fileURLToPath(import.meta.url)), '..', 'migrations');
++
++async function main(): Promise<void> {
++  const config = loadConfig();
++  const db = openDatabase(config.databasePath);
++  const migrations = migrate(db, MIGRATIONS_DIR);
++
++  const app = buildApp({ config, db });
++  app.log.info({ applied: migrations.applied }, 'database migrations checked');
++
++  let shuttingDown = false;
++  const shutdown = async (signal: string): Promise<void> => {
++    if (shuttingDown) return;
++    shuttingDown = true;
++    app.log.info({ signal }, 'shutting down');
++    try {
++      // Stops accepting connections, lets in-flight requests finish, then runs the onClose hooks.
++      await app.close();
++      db.close();
++      process.exit(0);
++    } catch (error) {
++      app.log.error({ err: error }, 'shutdown failed');
++      process.exit(1);
++    }
++  };
++  process.on('SIGTERM', () => void shutdown('SIGTERM'));
++  process.on('SIGINT', () => void shutdown('SIGINT'));
++
++  await app.listen({ host: config.host, port: config.port });
++}
++
++main().catch((error: unknown) => {
++  console.error(error);
++  process.exit(1);
++});
+
+===================================================================
+--- /dev/null
++++ b/test/helpers.ts
+@@ -0,0 +1,66 @@
++import { dirname, join } from 'node:path';
++import { fileURLToPath } from 'node:url';
++import type { FastifyInstance } from 'fastify';
++import { buildApp } from '../src/app.ts';
++import { loadConfig, type Config } from '../src/config.ts';
++import { openDatabase, type Database } from '../src/db/database.ts';
++import { migrate } from '../src/db/migrator.ts';
++
++export const MIGRATIONS_DIR = join(dirname(fileURLToPath(import.meta.url)), '..', 'migrations');
++
++/** A clock the test moves by hand, so time-dependent behaviour is deterministic. */
++export class FakeClock {
++  private current: number;
++
++  constructor(start = '2026-03-01T12:00:00.000Z') {
++    this.current = new Date(start).getTime();
++  }
++
++  now = (): Date => new Date(this.current);
++
++  advance(ms: number): void {
++    this.current += ms;
++  }
++}
++
++export interface TestApp {
++  app: FastifyInstance;
++  db: Database;
++  clock: FakeClock;
++  config: Config;
++}
++
++export function testConfig(env: Record<string, string> = {}): Config {
++  return loadConfig({
++    DATABASE_PATH: ':memory:',
++    PUBLIC_BASE_URL: 'https://sho.rt',
++    LOG_LEVEL: 'silent',
++    RATE_LIMIT_CAPACITY: '100',
++    ...env,
++  });
++}
++
++/** Builds the full app on an in-memory database. Requests go through `app.inject`, with no socket. */
++export function createTestApp(
++  options: { env?: Record<string, string>; generateCode?: () => string; db?: Database } = {},
++): TestApp {
++  const config = testConfig(options.env);
++  const db = options.db ?? openDatabase(config.databasePath);
++  migrate(db, MIGRATIONS_DIR);
++  const clock = new FakeClock();
++  const app = buildApp({
++    config,
++    db,
++    now: clock.now,
++    ...(options.generateCode ? { generateCode: options.generateCode } : {}),
++  });
++  return { app, db, clock, config };
++}
++
++export async function createLink(
++  app: FastifyInstance,
++  body: Record<string, unknown>,
++): Promise<{ status: number; body: Record<string, any> }> {
++  const response = await app.inject({ method: 'POST', url: '/api/v1/links', payload: body });
++  return { status: response.statusCode, body: response.json() };
++}
+
+===================================================================
+--- /dev/null
++++ b/test/integration/links.api.test.ts
+@@ -0,0 +1,159 @@
++import { afterEach, beforeEach, describe, expect, it } from 'vitest';
++import { createLink, createTestApp, type TestApp } from '../helpers.ts';
++
++describe('links API', () => {
++  let t: TestApp;
++  beforeEach(() => {
++    t = createTestApp();
++  });
++  afterEach(async () => {
++    await t.app.close();
++  });
++
++  describe('POST /api/v1/links', () => {
++    it('creates a link with a generated code', async () => {
++      const response = await t.app.inject({
++        method: 'POST',
++        url: '/api/v1/links',
++        payload: { url: 'https://example.com/landing?utm=1' },
++      });
++      expect(response.statusCode).toBe(201);
++      const body = response.json();
++      expect(body.code).toMatch(/^[0-9A-Za-z]{7}$/);
++      expect(body).toEqual({
++        code: body.code,
++        shortUrl: `https://sho.rt/${body.code}`,
++        targetUrl: 'https://example.com/landing?utm=1',
++        createdAt: '2026-03-01T12:00:00.000Z',
++      });
++      expect(response.headers.location).toBe(`/api/v1/links/${body.code}`);
++    });
++
++    it('creates a link with a custom alias', async () => {
++      const { status, body } = await createLink(t.app, { url: 'https://example.com', alias: 'spring-sale' });
++      expect(status).toBe(201);
++      expect(body.code).toBe('spring-sale');
++      expect(body.shortUrl).toBe('https://sho.rt/spring-sale');
++    });
++
++    it('returns 409 when the alias is already taken', async () => {
++      await createLink(t.app, { url: 'https://example.com/a', alias: 'promo' });
++      const { status, body } = await createLink(t.app, { url: 'https://example.com/b', alias: 'promo' });
++      expect(status).toBe(409);
++      expect(body.code).toBe('alias_taken');
++    });
++
++    it.each([
++      ['missing url', {}],
++      ['empty url', { url: '' }],
++      ['non-http scheme', { url: 'javascript:alert(1)' }],
++      ['credentials in url', { url: 'https://user:pass@example.com' }],
++      ['link to itself', { url: 'https://sho.rt/abc' }],
++      ['invalid alias', { url: 'https://example.com', alias: 'No Spaces' }],
++      ['reserved alias', { url: 'https://example.com', alias: 'api' }],
++      ['unknown field', { url: 'https://example.com', admin: true }],
++      ['wrong type', { url: 42 }],
++    ])('returns a 400 problem document for %s', async (_label, payload) => {
++      const response = await t.app.inject({ method: 'POST', url: '/api/v1/links', payload });
++      expect(response.statusCode).toBe(400);
++      expect(response.headers['content-type']).toContain('application/problem+json');
++      expect(response.json()).toMatchObject({ status: 400, code: 'validation_error' });
++    });
++
++    it('returns a 400 problem document for malformed JSON', async () => {
++      const response = await t.app.inject({
++        method: 'POST',
++        url: '/api/v1/links',
++        headers: { 'content-type': 'application/json' },
++        payload: '{"url": ',
++      });
++      expect(response.statusCode).toBe(400);
++      expect(response.json()).toMatchObject({ status: 400, code: 'bad_request' });
++    });
++
++    it('rejects bodies over the size limit', async () => {
++      const response = await t.app.inject({
++        method: 'POST',
++        url: '/api/v1/links',
++        payload: { url: `https://example.com/${'a'.repeat(20_000)}` },
++      });
++      expect(response.statusCode).toBe(413);
++    });
++
++    it('retries with a new code when a generated code collides', async () => {
++      await t.app.close();
++      const codes = ['taken01', 'taken01', 'fresh02'];
++      t = createTestApp({ generateCode: () => codes.shift()! });
++      const first = await createLink(t.app, { url: 'https://example.com/1' });
++      const second = await createLink(t.app, { url: 'https://example.com/2' });
++      expect(first.body.code).toBe('taken01');
++      expect(second.status).toBe(201);
++      expect(second.body.code).toBe('fresh02');
++    });
++
++    it('returns 503 instead of looping forever when no unique code can be found', async () => {
++      await t.app.close();
++      t = createTestApp({ generateCode: () => 'samecode' });
++      await createLink(t.app, { url: 'https://example.com/1' });
++      const { status, body } = await createLink(t.app, { url: 'https://example.com/2' });
++      expect(status).toBe(503);
++      expect(body.code).toBe('code_generation_failed');
++    });
++  });
++
++  describe('GET /api/v1/links/:code', () => {
++    it('returns the link', async () => {
++      const created = await createLink(t.app, { url: 'https://example.com/x', alias: 'lookup' });
++      const response = await t.app.inject({ method: 'GET', url: '/api/v1/links/lookup' });
++      expect(response.statusCode).toBe(200);
++      expect(response.json()).toEqual(created.body);
++    });
++
++    it('returns 404 for an unknown code', async () => {
++      const response = await t.app.inject({ method: 'GET', url: '/api/v1/links/nothere' });
++      expect(response.statusCode).toBe(404);
++      expect(response.json()).toMatchObject({ status: 404, code: 'link_not_found' });
++    });
++  });
++
++  describe('GET /:code', () => {
++    it('redirects to the target with 302 and no caching', async () => {
++      await createLink(t.app, { url: 'https://example.com/landing', alias: 'go-here' });
++      const response = await t.app.inject({ method: 'GET', url: '/go-here' });
++      expect(response.statusCode).toBe(302);
++      expect(response.headers.location).toBe('https://example.com/landing');
++      expect(response.headers['cache-control']).toBe('no-store');
++      expect(response.headers['referrer-policy']).toBe('no-referrer');
++    });
++
++    it('returns 404 for an unknown code', async () => {
++      const response = await t.app.inject({ method: 'GET', url: '/unknown1' });
++      expect(response.statusCode).toBe(404);
++      expect(response.json().code).toBe('link_not_found');
++    });
++
++    it.each(['/a', '/has.dot', '/%00%00%00', `/${'a'.repeat(40)}`])(
++      'returns 404 for the malformed code %s without querying for it',
++      async (path) => {
++        const response = await t.app.inject({ method: 'GET', url: path });
++        expect(response.statusCode).toBe(404);
++      },
++    );
++
++    it('treats codes as case sensitive', async () => {
++      await createLink(t.app, { url: 'https://example.com', alias: 'lower' });
++      expect((await t.app.inject({ method: 'GET', url: '/LOWER' })).statusCode).toBe(404);
++    });
++  });
++
++  it('returns a 404 problem document for unknown routes', async () => {
++    const response = await t.app.inject({ method: 'DELETE', url: '/api/v1/nothing' });
++    expect(response.statusCode).toBe(404);
++    expect(response.json()).toMatchObject({ status: 404, code: 'not_found' });
++  });
++
++  it('sets nosniff on every response', async () => {
++    const response = await t.app.inject({ method: 'GET', url: '/healthz' });
++    expect(response.headers['x-content-type-options']).toBe('nosniff');
++  });
++});
+
+===================================================================
+--- /dev/null
++++ b/test/integration/reliability.test.ts
+@@ -0,0 +1,87 @@
++import { afterEach, describe, expect, it } from 'vitest';
++import { createLink, createTestApp, type TestApp } from '../helpers.ts';
++
++describe('reliability', () => {
++  let t: TestApp;
++  afterEach(async () => {
++    await t.app.close();
++  });
++
++  describe('rate limiting', () => {
++    it('returns 429 with Retry-After once the burst is used up, then recovers', async () => {
++      t = createTestApp({ env: { RATE_LIMIT_CAPACITY: '2', RATE_LIMIT_REFILL_PER_SECOND: '1' } });
++      expect((await createLink(t.app, { url: 'https://example.com/1' })).status).toBe(201);
++      expect((await createLink(t.app, { url: 'https://example.com/2' })).status).toBe(201);
++
++      const limited = await t.app.inject({
++        method: 'POST',
++        url: '/api/v1/links',
++        payload: { url: 'https://example.com/3' },
++      });
++      expect(limited.statusCode).toBe(429);
++      expect(limited.headers['retry-after']).toBe('1');
++      expect(limited.json()).toMatchObject({ status: 429, code: 'rate_limited' });
++
++      t.clock.advance(1000);
++      expect((await createLink(t.app, { url: 'https://example.com/3' })).status).toBe(201);
++    });
++
++    it('does not rate limit redirects', async () => {
++      t = createTestApp({ env: { RATE_LIMIT_CAPACITY: '1' } });
++      await createLink(t.app, { url: 'https://example.com', alias: 'hot-link' });
++      for (let i = 0; i < 20; i++) {
++        expect((await t.app.inject({ method: 'GET', url: '/hot-link' })).statusCode).toBe(302);
++      }
++    });
++  });
++
++  describe('health', () => {
++    it('reports liveness and readiness', async () => {
++      t = createTestApp();
++      expect((await t.app.inject({ method: 'GET', url: '/healthz' })).json()).toEqual({ status: 'ok' });
++      expect((await t.app.inject({ method: 'GET', url: '/readyz' })).json()).toEqual({ status: 'ready' });
++    });
++
++    it('reports not ready when the database is unavailable', async () => {
++      t = createTestApp();
++      t.db.close();
++      const response = await t.app.inject({ method: 'GET', url: '/readyz' });
++      expect(response.statusCode).toBe(503);
++      expect(response.json()).toEqual({ status: 'unavailable' });
++    });
++  });
++
++  describe('failure handling', () => {
++    it('returns a generic 500 and leaks no internals when the database fails', async () => {
++      t = createTestApp();
++      await createLink(t.app, { url: 'https://example.com', alias: 'before' });
++      t.db.close();
++      const response = await t.app.inject({ method: 'GET', url: '/api/v1/links/before' });
++      expect(response.statusCode).toBe(500);
++      expect(response.json()).toEqual({
++        type: 'urn:problem:internal_error',
++        title: 'Internal Server Error',
++        status: 500,
++        code: 'internal_error',
++        detail: 'An unexpected error occurred.',
++      });
++    });
++
++    it('serves redirects even when the click queue is full', async () => {
++      t = createTestApp({ env: { CLICK_QUEUE_MAX: '2', CLICK_FLUSH_INTERVAL_MS: '600000' } });
++      await createLink(t.app, { url: 'https://example.com', alias: 'busy' });
++      for (let i = 0; i < 5; i++) {
++        expect((await t.app.inject({ method: 'GET', url: '/busy' })).statusCode).toBe(302);
++      }
++      const stats = (await t.app.inject({ method: 'GET', url: '/api/v1/links/busy/stats' })).json();
++      expect(stats.totalClicks).toBe(2);
++    });
++  });
++
++  describe('configuration', () => {
++    it('fails fast on invalid configuration', () => {
++      expect(() => createTestApp({ env: { PORT: 'not-a-port' } })).toThrowError(/Invalid configuration/);
++      t = createTestApp();
++    });
++  });
++});
+
+===================================================================
+--- /dev/null
++++ b/test/integration/stats.api.test.ts
+@@ -0,0 +1,87 @@
++import { afterEach, beforeEach, describe, expect, it } from 'vitest';
++import { createLink, createTestApp, type TestApp } from '../helpers.ts';
++
++const DAY = 24 * 60 * 60 * 1000;
++
++describe('GET /api/v1/links/:code/stats', () => {
++  let t: TestApp;
++  beforeEach(async () => {
++    t = createTestApp();
++    await createLink(t.app, { url: 'https://example.com/landing', alias: 'campaign' });
++  });
++  afterEach(async () => {
++    await t.app.close();
++  });
++
++  const click = (referer?: string) =>
++    t.app.inject({ method: 'GET', url: '/campaign', headers: referer ? { referer } : {} });
++  const stats = async () => (await t.app.inject({ method: 'GET', url: '/api/v1/links/campaign/stats' })).json();
++
++  it('reports zero clicks for a new link', async () => {
++    expect(await stats()).toEqual({ code: 'campaign', totalClicks: 0, clicksByDay: [], topReferrers: [] });
++  });
++
++  it('counts every redirect', async () => {
++    await click();
++    await click();
++    await click();
++    expect((await stats()).totalClicks).toBe(3);
++  });
++
++  it('groups clicks by UTC day, oldest first', async () => {
++    await click();
++    t.clock.advance(DAY);
++    await click();
++    await click();
++    expect((await stats()).clicksByDay).toEqual([
++      { date: '2026-03-01', clicks: 1 },
++      { date: '2026-03-02', clicks: 2 },
++    ]);
++  });
++
++  it('limits the daily breakdown to the reporting window but keeps the full total', async () => {
++    await click();
++    t.clock.advance(31 * DAY);
++    await click();
++    const result = await stats();
++    expect(result.totalClicks).toBe(2);
++    expect(result.clicksByDay).toEqual([{ date: '2026-04-01', clicks: 1 }]);
++  });
++
++  it('ranks referrers by host and labels clicks without one as direct', async () => {
++    await click('https://news.example/story?id=1');
++    await click('https://news.example/other');
++    await click('https://social.example/post/9');
++    await click();
++    expect((await stats()).topReferrers).toEqual([
++      { referrer: 'news.example', clicks: 2 },
++      { referrer: 'direct', clicks: 1 },
++      { referrer: 'social.example', clicks: 1 },
++    ]);
++  });
++
++  it('stores only the referrer host, never the full URL', async () => {
++    await click('https://news.example/story?email=alice@example.com');
++    await stats();
++    const rows = t.db.prepare('SELECT referrer_host FROM click_events').all();
++    expect(rows).toEqual([{ referrer_host: 'news.example' }]);
++  });
++
++  it('does not count failed lookups', async () => {
++    await t.app.inject({ method: 'GET', url: '/missing1' });
++    expect((await stats()).totalClicks).toBe(0);
++  });
++
++  it('keeps stats separate per link', async () => {
++    await createLink(t.app, { url: 'https://example.com/other', alias: 'other' });
++    await click();
++    await t.app.inject({ method: 'GET', url: '/other' });
++    await t.app.inject({ method: 'GET', url: '/other' });
++    expect((await stats()).totalClicks).toBe(1);
++  });
++
++  it('returns 404 for an unknown link', async () => {
++    const response = await t.app.inject({ method: 'GET', url: '/api/v1/links/nothere/stats' });
++    expect(response.statusCode).toBe(404);
++  });
++});
+
+===================================================================
+--- /dev/null
++++ b/test/unit/clickRecorder.test.ts
+@@ -0,0 +1,74 @@
++import { describe, expect, it } from 'vitest';
++import { ClickRecorder, referrerHost } from '../../src/analytics/clickRecorder.ts';
++import { openDatabase } from '../../src/db/database.ts';
++import { migrate } from '../../src/db/migrator.ts';
++import { MIGRATIONS_DIR } from '../helpers.ts';
++
++function setup(maxQueue = 100) {
++  const db = openDatabase(':memory:');
++  migrate(db, MIGRATIONS_DIR);
++  db.prepare("INSERT INTO links (code, target_url, created_at) VALUES ('abc1234', 'https://example.com/', '2026-03-01T00:00:00.000Z')").run();
++  const recorder = new ClickRecorder(db, { flushIntervalMs: 60_000, maxQueue });
++  const click = (referrer: string | null = null) =>
++    recorder.record({ code: 'abc1234', clickedAt: '2026-03-01T12:00:00.000Z', referrerHost: referrer });
++  const count = () =>
++    (db.prepare("SELECT click_count FROM links WHERE code = 'abc1234'").get() as { click_count: number }).click_count;
++  const events = () => (db.prepare('SELECT COUNT(*) AS n FROM click_events').get() as { n: number }).n;
++  return { db, recorder, click, count, events };
++}
++
++describe('ClickRecorder', () => {
++  it('buffers clicks and writes nothing until flushed', () => {
++    const { recorder, click, count, events } = setup();
++    click();
++    click();
++    expect(recorder.pending).toBe(2);
++    expect(count()).toBe(0);
++    expect(events()).toBe(0);
++  });
++
++  it('writes the events and the running total together on flush', () => {
++    const { recorder, click, count, events } = setup();
++    click('news.example');
++    click();
++    click();
++    expect(recorder.flush()).toBe(3);
++    expect(recorder.pending).toBe(0);
++    expect(count()).toBe(3);
++    expect(events()).toBe(3);
++  });
++
++  it('drops clicks beyond the queue bound and counts them', () => {
++    const { recorder, click, count } = setup(2);
++    click();
++    click();
++    click();
++    expect(recorder.pending).toBe(2);
++    expect(recorder.dropped).toBe(1);
++    recorder.flush();
++    expect(count()).toBe(2);
++  });
++
++  it('keeps the batch and leaves the database untouched when a flush fails', () => {
++    const { recorder, click, count, events } = setup();
++    click();
++    // A click for a code with no link violates the foreign key, so the whole batch must roll back.
++    recorder.record({ code: 'missing', clickedAt: '2026-03-01T12:00:00.000Z', referrerHost: null });
++    expect(() => recorder.flush()).toThrowError();
++    expect(recorder.pending).toBe(2);
++    expect(count()).toBe(0);
++    expect(events()).toBe(0);
++  });
++});
++
++describe('referrerHost', () => {
++  it('keeps only the host of a referrer URL', () => {
++    expect(referrerHost('https://News.Example/article?user=alice@example.com')).toBe('news.example');
++  });
++
++  it('returns null for a missing or malformed header', () => {
++    expect(referrerHost(undefined)).toBeNull();
++    expect(referrerHost('')).toBeNull();
++    expect(referrerHost('not a url')).toBeNull();
++  });
++});
+
+===================================================================
+--- /dev/null
++++ b/test/unit/migrator.test.ts
+@@ -0,0 +1,55 @@
++import { mkdtempSync, writeFileSync } from 'node:fs';
++import { tmpdir } from 'node:os';
++import { join } from 'node:path';
++import { describe, expect, it } from 'vitest';
++import { openDatabase } from '../../src/db/database.ts';
++import { migrate } from '../../src/db/migrator.ts';
++import { MIGRATIONS_DIR } from '../helpers.ts';
++
++function tempMigrations(files: Record<string, string>): string {
++  const dir = mkdtempSync(join(tmpdir(), 'migrations-'));
++  for (const [name, sql] of Object.entries(files)) writeFileSync(join(dir, name), sql);
++  return dir;
++}
++
++describe('migrate', () => {
++  it('applies the real migrations once and is a no-op the second time', () => {
++    const db = openDatabase(':memory:');
++    const first = migrate(db, MIGRATIONS_DIR);
++    expect(first.applied.length).toBeGreaterThan(0);
++    expect(first.applied[0]).toBe('001_init.sql');
++
++    const second = migrate(db, MIGRATIONS_DIR);
++    expect(second.applied).toEqual([]);
++    expect(second.alreadyApplied).toEqual(first.applied);
++  });
++
++  it('applies files in numeric order and ignores files that are not migrations', () => {
++    const dir = tempMigrations({
++      '002_add_column.sql': 'ALTER TABLE t ADD COLUMN b TEXT;',
++      '001_create.sql': 'CREATE TABLE t (a TEXT);',
++      'notes.txt': 'not sql',
++    });
++    const db = openDatabase(':memory:');
++    expect(migrate(db, dir).applied).toEqual(['001_create.sql', '002_add_column.sql']);
++  });
++
++  it('refuses to start when an applied migration has been edited', () => {
++    const dir = tempMigrations({ '001_create.sql': 'CREATE TABLE t (a TEXT);' });
++    const db = openDatabase(':memory:');
++    migrate(db, dir);
++    writeFileSync(join(dir, '001_create.sql'), 'CREATE TABLE t (a TEXT, b TEXT);');
++    expect(() => migrate(db, dir)).toThrowError(/modified after it was applied/);
++  });
++
++  it('rolls back a migration that fails part-way and does not record it', () => {
++    const dir = tempMigrations({
++      '001_broken.sql': 'CREATE TABLE ok (a TEXT); CREATE TABLE ok (a TEXT);',
++    });
++    const db = openDatabase(':memory:');
++    expect(() => migrate(db, dir)).toThrowError();
++    const tables = db.prepare("SELECT name FROM sqlite_master WHERE name = 'ok'").all();
++    expect(tables).toEqual([]);
++    expect(db.prepare('SELECT COUNT(*) AS n FROM schema_migrations').get()).toEqual({ n: 0 });
++  });
++});
+
+===================================================================
+--- /dev/null
++++ b/test/unit/rateLimiter.test.ts
+@@ -0,0 +1,60 @@
++import { describe, expect, it } from 'vitest';
++import { TokenBucketLimiter } from '../../src/http/rateLimiter.ts';
++
++function limiterAt(start: number, overrides: { capacity?: number; refillPerSecond?: number; maxKeys?: number } = {}) {
++  const time = { now: start };
++  const limiter = new TokenBucketLimiter({
++    capacity: 3,
++    refillPerSecond: 1,
++    ...overrides,
++    now: () => time.now,
++  });
++  return { limiter, time };
++}
++
++describe('TokenBucketLimiter', () => {
++  it('allows a burst up to capacity, then refuses', () => {
++    const { limiter } = limiterAt(0);
++    expect([1, 2, 3].map(() => limiter.take('a').allowed)).toEqual([true, true, true]);
++    const refused = limiter.take('a');
++    expect(refused.allowed).toBe(false);
++    expect(refused.retryAfterSeconds).toBe(1);
++  });
++
++  it('refills over time, but never above capacity', () => {
++    const { limiter, time } = limiterAt(0);
++    for (let i = 0; i < 3; i++) limiter.take('a');
++    time.now += 2000;
++    expect(limiter.take('a').allowed).toBe(true);
++    expect(limiter.take('a').allowed).toBe(true);
++    expect(limiter.take('a').allowed).toBe(false);
++
++    time.now += 60_000;
++    const allowed = [1, 2, 3, 4].map(() => limiter.take('a').allowed);
++    expect(allowed).toEqual([true, true, true, false]);
++  });
++
++  it('tracks each client independently', () => {
++    const { limiter } = limiterAt(0, { capacity: 1 });
++    expect(limiter.take('a').allowed).toBe(true);
++    expect(limiter.take('a').allowed).toBe(false);
++    expect(limiter.take('b').allowed).toBe(true);
++  });
++
++  it('reports how long to wait when the refill rate is slow', () => {
++    const { limiter } = limiterAt(0, { capacity: 1, refillPerSecond: 0.1 });
++    limiter.take('a');
++    expect(limiter.take('a').retryAfterSeconds).toBe(10);
++  });
++
++  it('evicts the least recently used client once the key bound is reached', () => {
++    const { limiter } = limiterAt(0, { capacity: 1, maxKeys: 2 });
++    limiter.take('a');
++    limiter.take('b');
++    limiter.take('a'); // touch "a" so "b" is now the oldest
++    limiter.take('c');
++    expect(limiter.trackedKeys).toBe(2);
++    // "b" was evicted, so it starts with a full bucket again; "a" was kept and is still empty.
++    expect(limiter.take('b').allowed).toBe(true);
++  });
++});
+
+===================================================================
+--- /dev/null
++++ b/test/unit/shortCode.test.ts
+@@ -0,0 +1,48 @@
++import { describe, expect, it } from 'vitest';
++import { AppError } from '../../src/domain/errors.ts';
++import { CODE_LENGTH, CODE_PATTERN, generateCode, validateAlias } from '../../src/domain/shortCode.ts';
++
++describe('generateCode', () => {
++  it('produces codes of the configured length from the base62 alphabet', () => {
++    for (let i = 0; i < 200; i++) {
++      const code = generateCode();
++      expect(code).toHaveLength(CODE_LENGTH);
++      expect(code).toMatch(/^[0-9A-Za-z]+$/);
++      expect(code).toMatch(CODE_PATTERN);
++    }
++  });
++
++  it('uses the injected random source for every character', () => {
++    const picks = [0, 10, 36, 61];
++    let call = 0;
++    const code = generateCode(4, () => picks[call++]!);
++    expect(code).toBe('0Aaz');
++  });
++
++  it('does not repeat across a large sample', () => {
++    const codes = new Set(Array.from({ length: 5000 }, () => generateCode()));
++    expect(codes.size).toBe(5000);
++  });
++});
++
++describe('validateAlias', () => {
++  it.each(['abc', 'spring-sale', 'q4_2026', '9lives'])('accepts %s', (alias) => {
++    expect(validateAlias(alias)).toBe(alias);
++  });
++
++  it.each([
++    ['too short', 'ab'],
++    ['too long', 'a'.repeat(33)],
++    ['uppercase', 'Promo'],
++    ['leading dash', '-promo'],
++    ['path traversal', '../etc'],
++    ['spaces', 'my link'],
++    ['slash', 'a/b'],
++  ])('rejects %s', (_label, alias) => {
++    expect(() => validateAlias(alias)).toThrowError(AppError);
++  });
++
++  it.each(['api', 'healthz', 'readyz', 'admin'])('rejects reserved alias %s', (alias) => {
++    expect(() => validateAlias(alias)).toThrowError(/reserved/);
++  });
++});
+
+===================================================================
+--- /dev/null
++++ b/test/unit/urlPolicy.test.ts
+@@ -0,0 +1,39 @@
++import { describe, expect, it } from 'vitest';
++import { MAX_URL_LENGTH, normalizeTargetUrl } from '../../src/domain/urlPolicy.ts';
++
++const options = { selfHost: 'sho.rt' };
++
++describe('normalizeTargetUrl', () => {
++  it('accepts http and https URLs and normalizes them', () => {
++    expect(normalizeTargetUrl('https://Example.com/a?b=1#c', options)).toBe('https://example.com/a?b=1#c');
++    expect(normalizeTargetUrl('http://example.com', options)).toBe('http://example.com/');
++  });
++
++  it.each([
++    ['javascript scheme', 'javascript:alert(1)'],
++    ['data scheme', 'data:text/html,<script>alert(1)</script>'],
++    ['file scheme', 'file:///etc/passwd'],
++    ['ftp scheme', 'ftp://example.com/file'],
++    ['relative path', '/just/a/path'],
++    ['not a url', 'not a url'],
++    ['embedded credentials', 'https://user:pass@example.com/'],
++    ['username only', 'https://admin@example.com/'],
++  ])('rejects %s', (_label, input) => {
++    expect(() => normalizeTargetUrl(input, options)).toThrowError();
++  });
++
++  it('rejects URLs longer than the limit', () => {
++    const long = `https://example.com/${'a'.repeat(MAX_URL_LENGTH)}`;
++    expect(() => normalizeTargetUrl(long, options)).toThrowError(/at most/);
++  });
++
++  it('rejects links that point back at the service, in any letter case', () => {
++    expect(() => normalizeTargetUrl('https://sho.rt/abc1234', options)).toThrowError(/this service/);
++    expect(() => normalizeTargetUrl('https://SHO.RT/abc1234', options)).toThrowError(/this service/);
++  });
++
++  it('cannot be used to smuggle a header line into the Location header', () => {
++    const normalized = normalizeTargetUrl('https://example.com/a\r\nSet-Cookie: x=1', options);
++    expect(normalized).not.toMatch(/[\r\n]/);
++  });
++});
+
+===================================================================
+--- /dev/null
++++ b/tsconfig.json
+@@ -0,0 +1,18 @@
++{
++  "compilerOptions": {
++    "target": "es2023",
++    "module": "nodenext",
++    "moduleResolution": "nodenext",
++    "strict": true,
++    "noUncheckedIndexedAccess": true,
++    "noImplicitOverride": true,
++    "noFallthroughCasesInSwitch": true,
++    "erasableSyntaxOnly": true,
++    "verbatimModuleSyntax": true,
++    "allowImportingTsExtensions": true,
++    "noEmit": true,
++    "types": ["node"],
++    "skipLibCheck": true
++  },
++  "include": ["src", "test"]
++}
+
+===================================================================
+--- /dev/null
++++ b/vitest.config.ts
+@@ -0,0 +1,8 @@
++import { defineConfig } from 'vitest/config';
++
++export default defineConfig({
++  test: {
++    include: ['test/**/*.test.ts'],
++    environment: 'node',
++  },
++});

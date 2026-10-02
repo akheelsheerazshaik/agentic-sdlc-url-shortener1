@@ -1,0 +1,265 @@
+openapi: 3.1.0
+info:
+  title: URL Shortener API
+  version: 1.2.0
+  description: Create short links, redirect to their targets, and read click analytics.
+servers:
+  - url: http://localhost:3000
+paths:
+  /api/v1/links:
+    post:
+      operationId: createLink
+      summary: Create a short link
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateLinkRequest'
+      responses:
+        '201':
+          description: Link created.
+          headers:
+            Location:
+              description: Path of the created link resource.
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Link'
+        '400':
+          $ref: '#/components/responses/Problem'
+        '409':
+          description: The requested alias is already in use.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '503':
+          $ref: '#/components/responses/Problem'
+  /api/v1/links/{code}:
+    get:
+      operationId: getLink
+      summary: Get a link
+      description: Returns the link whether or not it has expired.
+      parameters:
+        - $ref: '#/components/parameters/Code'
+      responses:
+        '200':
+          description: The link.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Link'
+        '404':
+          $ref: '#/components/responses/Problem'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+  /api/v1/links/{code}/stats:
+    get:
+      operationId: getLinkStats
+      summary: Get click analytics for a link
+      parameters:
+        - $ref: '#/components/parameters/Code'
+      responses:
+        '200':
+          description: Click analytics.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LinkStats'
+        '404':
+          $ref: '#/components/responses/Problem'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+  /{code}:
+    get:
+      operationId: redirect
+      summary: Redirect to the link's target
+      parameters:
+        - $ref: '#/components/parameters/Code'
+      responses:
+        '302':
+          description: Redirect to the target URL. Never cached, so every click is counted.
+          headers:
+            Location:
+              schema:
+                type: string
+                format: uri
+            Cache-Control:
+              schema:
+                type: string
+                const: no-store
+        '404':
+          $ref: '#/components/responses/Problem'
+        '410':
+          description: >-
+            The link has expired (code `link_expired`) or its destination is no longer allowed
+            (code `link_blocked`). No Location header is sent and no click is recorded.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /healthz:
+    get:
+      operationId: liveness
+      summary: Liveness probe
+      responses:
+        '200':
+          description: The process is running.
+  /readyz:
+    get:
+      operationId: readiness
+      summary: Readiness probe
+      responses:
+        '200':
+          description: The service can reach its database.
+        '503':
+          description: The database is unavailable.
+components:
+  parameters:
+    Code:
+      name: code
+      in: path
+      required: true
+      schema:
+        type: string
+        pattern: '^[A-Za-z0-9_-]{3,32}$'
+  responses:
+    Problem:
+      description: Error, as an RFC 9457 problem document.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    RateLimited:
+      description: Too many requests from this client.
+      headers:
+        Retry-After:
+          description: Seconds to wait before retrying.
+          schema:
+            type: integer
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+  schemas:
+    CreateLinkRequest:
+      type: object
+      additionalProperties: false
+      required: [url]
+      properties:
+        url:
+          type: string
+          format: uri
+          maxLength: 2048
+          description: >-
+            Absolute http or https URL, without embedded credentials. Internal addresses and host names,
+            and hosts on the operator's denylist, are rejected.
+        alias:
+          type: string
+          pattern: '^[a-z0-9][a-z0-9_-]{2,31}$'
+          description: Optional custom code. Lowercase only; some names are reserved.
+        expiresAt:
+          type: string
+          format: date-time
+          description: >-
+            Instant after which the link stops redirecting. Must include a time zone and be in the future.
+            Cannot be combined with ttlSeconds.
+        ttlSeconds:
+          type: integer
+          minimum: 1
+          maximum: 157680000
+          description: Lifetime in seconds from creation, up to five years. Cannot be combined with expiresAt.
+    Link:
+      type: object
+      required: [code, shortUrl, targetUrl, createdAt, expiresAt]
+      properties:
+        code:
+          type: string
+        shortUrl:
+          type: string
+          format: uri
+        targetUrl:
+          type: string
+          format: uri
+        createdAt:
+          type: string
+          format: date-time
+        expiresAt:
+          type: [string, 'null']
+          format: date-time
+          description: Expiry instant in UTC, or null if the link never expires.
+    LinkStats:
+      type: object
+      required: [code, totalClicks, botClicks, nonBotClicks, clicksByDevice, clicksByDay, topReferrers]
+      properties:
+        code:
+          type: string
+        totalClicks:
+          type: integer
+          minimum: 0
+          description: All recorded clicks. Always botClicks + nonBotClicks.
+        botClicks:
+          type: integer
+          minimum: 0
+          description: Clicks from clients that identified themselves as automated.
+        nonBotClicks:
+          type: integer
+          minimum: 0
+          description: >-
+            Clicks not identified as automated. Includes clicks of unknown device class, and automated
+            clients that present a browser User-Agent.
+        clicksByDevice:
+          type: array
+          description: One entry per device class, in a fixed order, including classes with no clicks.
+          items:
+            type: object
+            required: [device, clicks]
+            properties:
+              device:
+                type: string
+                enum: [desktop, mobile, tablet, bot, unknown]
+              clicks:
+                type: integer
+        clicksByDay:
+          type: array
+          description: Clicks per UTC day over the last 30 days, oldest first. Days without clicks are omitted.
+          items:
+            type: object
+            required: [date, clicks]
+            properties:
+              date:
+                type: string
+                format: date
+              clicks:
+                type: integer
+        topReferrers:
+          type: array
+          description: Up to 10 referring hosts. Clicks without a referrer are reported as "direct".
+          items:
+            type: object
+            required: [referrer, clicks]
+            properties:
+              referrer:
+                type: string
+              clicks:
+                type: integer
+    Problem:
+      type: object
+      required: [type, title, status, code, detail]
+      properties:
+        type:
+          type: string
+        title:
+          type: string
+        status:
+          type: integer
+        code:
+          type: string
+          description: Stable machine-readable error code.
+        detail:
+          type: string

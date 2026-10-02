@@ -1,0 +1,191 @@
+{
+  "summary": "API and boundary tests for expiry, a compatibility test for links stored before the migration, and regression tests for BUG-17.",
+  "changes": [
+    {
+      "path": "test/integration/expiry.api.test.ts",
+      "action": "create",
+      "taskIds": [
+        "T-6"
+      ]
+    },
+    {
+      "path": "test/integration/links.api.test.ts",
+      "action": "modify",
+      "taskIds": [
+        "T-6"
+      ]
+    },
+    {
+      "path": "test/integration/shutdown.test.ts",
+      "action": "create",
+      "taskIds": [
+        "T-7"
+      ]
+    },
+    {
+      "path": "test/unit/clickRecorder.test.ts",
+      "action": "modify",
+      "taskIds": [
+        "T-7"
+      ]
+    },
+    {
+      "path": "test/unit/linkExpiry.test.ts",
+      "action": "create",
+      "taskIds": [
+        "T-6"
+      ]
+    }
+  ],
+  "coverage": [
+    {
+      "criterionId": "AC-1.1",
+      "tests": [
+        {
+          "file": "test/integration/expiry.api.test.ts",
+          "name": "accepts an absolute expiry and stores it in UTC"
+        }
+      ]
+    },
+    {
+      "criterionId": "AC-1.2",
+      "tests": [
+        {
+          "file": "test/integration/expiry.api.test.ts",
+          "name": "accepts a time-to-live relative to now"
+        }
+      ]
+    },
+    {
+      "criterionId": "AC-1.3",
+      "tests": [
+        {
+          "file": "test/integration/expiry.api.test.ts",
+          "name": "rejects an expiry in the past with 400"
+        },
+        {
+          "file": "test/integration/expiry.api.test.ts",
+          "name": "rejects an expiry equal to now with 400"
+        },
+        {
+          "file": "test/integration/expiry.api.test.ts",
+          "name": "rejects both expiresAt and ttlSeconds with 400"
+        },
+        {
+          "file": "test/integration/expiry.api.test.ts",
+          "name": "rejects an expiry without a time zone with 400"
+        },
+        {
+          "file": "test/integration/expiry.api.test.ts",
+          "name": "rejects a ttl beyond the maximum with 400"
+        }
+      ]
+    },
+    {
+      "criterionId": "AC-1.4",
+      "tests": [
+        {
+          "file": "test/integration/expiry.api.test.ts",
+          "name": "never expires by default"
+        }
+      ]
+    },
+    {
+      "criterionId": "AC-2.1",
+      "tests": [
+        {
+          "file": "test/integration/expiry.api.test.ts",
+          "name": "redirects until the expiry instant"
+        },
+        {
+          "file": "test/unit/linkExpiry.test.ts",
+          "name": "is false one millisecond before the expiry instant"
+        }
+      ]
+    },
+    {
+      "criterionId": "AC-2.2",
+      "tests": [
+        {
+          "file": "test/integration/expiry.api.test.ts",
+          "name": "returns 410 Gone from the expiry instant onwards, with no Location header"
+        },
+        {
+          "file": "test/unit/linkExpiry.test.ts",
+          "name": "is true at the expiry instant and afterwards"
+        }
+      ]
+    },
+    {
+      "criterionId": "AC-2.3",
+      "tests": [
+        {
+          "file": "test/integration/expiry.api.test.ts",
+          "name": "does not count requests to an expired link as clicks"
+        }
+      ]
+    },
+    {
+      "criterionId": "AC-3.1",
+      "tests": [
+        {
+          "file": "test/integration/expiry.api.test.ts",
+          "name": "still returns the link metadata and its stats"
+        }
+      ]
+    },
+    {
+      "criterionId": "AC-3.2",
+      "tests": [
+        {
+          "file": "test/integration/expiry.api.test.ts",
+          "name": "keeps the alias reserved, so an expired link cannot be taken over"
+        }
+      ]
+    },
+    {
+      "criterionId": "AC-4.1",
+      "tests": [
+        {
+          "file": "test/integration/shutdown.test.ts",
+          "name": "writes buffered clicks before the app closes"
+        },
+        {
+          "file": "test/unit/clickRecorder.test.ts",
+          "name": "flushes what is buffered when closed"
+        }
+      ]
+    },
+    {
+      "criterionId": "AC-4.2",
+      "tests": [
+        {
+          "file": "test/integration/shutdown.test.ts",
+          "name": "still closes when the final flush fails"
+        }
+      ]
+    },
+    {
+      "criterionId": "AC-5.1",
+      "tests": [
+        {
+          "file": "test/integration/expiry.api.test.ts",
+          "name": "leaves links created before the expiry migration working"
+        }
+      ]
+    },
+    {
+      "criterionId": "AC-5.2",
+      "tests": [
+        {
+          "file": "test/integration/links.api.test.ts",
+          "name": "creates a link with a generated code"
+        },
+        {
+          "file": "test/integration/links.api.test.ts",
+          "name": "GET /api/v1/links/:code returns the link"
+        }
+      ]
+    }
+  ]
+}

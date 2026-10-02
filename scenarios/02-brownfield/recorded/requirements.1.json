@@ -1,0 +1,114 @@
+{
+  "title": "Link expiry, and clicks lost on restart",
+  "intent": "Add an optional expiry to links so that a redirect stops at a chosen moment while the link's record and statistics stay readable, and fix the loss of buffered click events when the service shuts down. Both must be additive: no existing link, client or stored row may change behaviour.",
+  "functionalRequirements": [
+    {
+      "id": "FR-1",
+      "statement": "A link can be created with an optional expiry, given either as an absolute time or as a time-to-live.",
+      "priority": "must",
+      "acceptanceCriteria": [
+        { "id": "AC-1.1", "statement": "expiresAt accepts an ISO-8601 time with a time zone; it is stored and returned in UTC." },
+        { "id": "AC-1.2", "statement": "ttlSeconds sets the expiry that many seconds after creation." },
+        { "id": "AC-1.3", "statement": "An invalid expiry returns 400: a time that is not in the future, both fields at once, a value that is not a timestamp or has no time zone, or a time-to-live that is zero, negative, fractional or above the maximum." },
+        { "id": "AC-1.4", "statement": "A link created without an expiry reports expiresAt as null and never expires." }
+      ]
+    },
+    {
+      "id": "FR-2",
+      "statement": "An expired link no longer redirects, and says so.",
+      "priority": "must",
+      "acceptanceCriteria": [
+        { "id": "AC-2.1", "statement": "The link redirects normally up to, but not including, its expiry instant." },
+        { "id": "AC-2.2", "statement": "From the expiry instant the redirect returns 410 Gone as a problem document with code link_expired and no Location header." },
+        { "id": "AC-2.3", "statement": "A request to an expired link is not counted as a click." }
+      ]
+    },
+    {
+      "id": "FR-3",
+      "statement": "An expired link remains a readable record.",
+      "priority": "must",
+      "acceptanceCriteria": [
+        { "id": "AC-3.1", "statement": "The link's metadata and its statistics are still returned after it has expired." },
+        { "id": "AC-3.2", "statement": "The alias of an expired link cannot be registered again." }
+      ]
+    },
+    {
+      "id": "FR-4",
+      "statement": "BUG-17: clicks accepted before a graceful shutdown are not lost.",
+      "priority": "must",
+      "acceptanceCriteria": [
+        { "id": "AC-4.1", "statement": "Clicks still buffered when the application closes are written to the database before it closes." },
+        { "id": "AC-4.2", "statement": "Shutdown completes even if that final write fails." }
+      ]
+    },
+    {
+      "id": "FR-5",
+      "statement": "Existing links and clients are unaffected.",
+      "priority": "must",
+      "acceptanceCriteria": [
+        { "id": "AC-5.1", "statement": "A link stored before this change still redirects and reports expiresAt as null." },
+        { "id": "AC-5.2", "statement": "Responses keep every existing field with its existing meaning; the only change is the added expiresAt field." }
+      ]
+    }
+  ],
+  "nonFunctionalRequirements": [
+    { "id": "NFR-1", "category": "compatibility", "statement": "The schema change is additive and leaves existing rows untouched." },
+    { "id": "NFR-2", "category": "performance", "statement": "The redirect path gains no additional database query." }
+  ],
+  "ambiguities": [
+    {
+      "id": "Q-1",
+      "term": "told the link has expired rather than that it never existed",
+      "question": "Which response distinguishes an expired link from an unknown one?",
+      "whyItMatters": "It is a public contract that clients and monitoring will depend on.",
+      "options": ["410 Gone with error code link_expired", "404 with a different message", "An HTML page explaining the expiry"],
+      "defaultAssumption": "410 Gone as a problem document with code link_expired, consistent with the API's existing error format.",
+      "blocking": false
+    },
+    {
+      "id": "Q-2",
+      "term": "After that moment",
+      "question": "Is the link still valid at exactly the expiry instant?",
+      "whyItMatters": "The boundary has to be defined for the tests to be exact and for clients to predict behaviour.",
+      "options": ["Expired from the instant onwards", "Still valid at the instant, expired after it"],
+      "defaultAssumption": "The link is expired from its expiry instant onwards.",
+      "blocking": false
+    },
+    {
+      "id": "Q-3",
+      "term": "a time-to-live in seconds",
+      "question": "Is there an upper bound on the lifetime?",
+      "whyItMatters": "An unbounded integer invites overflow and nonsensical dates.",
+      "options": ["Maximum of five years", "No maximum"],
+      "defaultAssumption": "A positive whole number of seconds, at most five years.",
+      "blocking": false
+    },
+    {
+      "id": "Q-4",
+      "term": "must no longer redirect",
+      "question": "May the alias of an expired link be reused for a new link?",
+      "whyItMatters": "If it can, someone else can register the alias of a link people already trust and send its visitors anywhere.",
+      "options": ["The alias stays reserved", "The alias becomes available again"],
+      "defaultAssumption": "The alias stays reserved, to prevent takeover of an expired link.",
+      "blocking": false
+    },
+    {
+      "id": "Q-5",
+      "term": "just before a restart",
+      "question": "Does the fix have to cover an abrupt kill of the process, or only a graceful shutdown?",
+      "whyItMatters": "A deployment sends SIGTERM and is a graceful shutdown. Surviving an abrupt kill needs every click written durably before the redirect returns, which contradicts the existing requirement that recording a click never slows a redirect.",
+      "options": ["Graceful shutdown only", "Also survive a crash, by writing each click synchronously"],
+      "defaultAssumption": "Graceful shutdown only, which is what a deployment is. Loss on an abrupt kill remains and is documented.",
+      "blocking": false
+    }
+  ],
+  "assumptions": [
+    { "id": "A-1", "statement": "Expired links are kept, not deleted, so that their statistics remain available." },
+    { "id": "A-2", "statement": "Expiry is checked when a link is resolved, using the row already loaded for the redirect." }
+  ],
+  "outOfScope": [
+    "Changing or removing the expiry of an existing link",
+    "Deleting expired links or their click events",
+    "Durable click recording that survives an abrupt process kill"
+  ]
+}

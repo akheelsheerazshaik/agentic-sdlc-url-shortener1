@@ -1,0 +1,75 @@
+{
+  "overview": "Expiry is a nullable instant on the link row, enforced when a link is resolved for a redirect. The redirect already loads the row by primary key, so the check costs a comparison and no extra query. The service gains a second read operation: get returns any stored link (used for metadata and statistics), resolve returns only a link that may be redirected to and raises link_expired otherwise. That split is what lets an expired link stay readable while its redirect answers 410.\n\nBUG-17 has a single cause. The click recorder's buffer is written only by its interval timer, and the application's close hook stops the timer and nothing else, so whatever was queued since the last tick is discarded on every deployment. The fix makes closing the recorder mean stop the timer and write the buffer, and runs it in the close hook, which Fastify invokes after in-flight requests finish and before the caller closes the database.",
+  "components": [
+    { "name": "Schema", "responsibility": "Add links.expires_at, nullable, with no backfill.", "files": ["migrations/002_link_expiry.sql"] },
+    { "name": "Link repository", "responsibility": "Persist and return the expiry.", "files": ["src/links/linkRepository.ts"] },
+    { "name": "Link service", "responsibility": "Validate and normalize the expiry on create; separate get (any link) from resolve (redirectable link).", "files": ["src/links/linkService.ts", "src/domain/errors.ts"] },
+    { "name": "Routes", "responsibility": "Accept the new fields, return expiresAt, redirect through resolve.", "files": ["src/http/routes.ts"] },
+    { "name": "Click recorder and app lifecycle", "responsibility": "Flush the buffer on close; never let a failed final flush block shutdown.", "files": ["src/analytics/clickRecorder.ts", "src/app.ts"] }
+  ],
+  "apiChanges": [
+    { "operation": "POST /api/v1/links", "change": "Optional expiresAt (date-time with zone) and ttlSeconds (1 to 157680000), mutually exclusive. Response adds expiresAt (string or null)." },
+    { "operation": "GET /api/v1/links/{code}", "change": "Response adds expiresAt. Still returned after expiry." },
+    { "operation": "GET /{code}", "change": "New 410 response with code link_expired once the link has expired." }
+  ],
+  "dataModelChanges": [
+    "links.expires_at TEXT NULL: ISO-8601 instant in UTC, NULL for no expiry."
+  ],
+  "decisions": [
+    {
+      "id": "ADR-1",
+      "title": "Enforce expiry when resolving, and keep the row",
+      "decision": "Store the expiry on the link and compare it with the current time in LinkService.resolve. Expired rows are not deleted.",
+      "rationale": "The owner must still read the stats of an expired link, and the visitor must be told it expired rather than that it never existed. Both need the row to remain. The check reuses the row the redirect already loads.",
+      "alternatives": ["A background job that deletes expired links: loses the statistics and turns expiry into a 404", "Filter expired rows in the SQL WHERE clause: cannot tell expired from unknown, so it cannot answer 410"]
+    },
+    {
+      "id": "ADR-2",
+      "title": "410 Gone with a link_expired code",
+      "decision": "An expired link's redirect answers 410 as a problem document with code link_expired, and sends no Location header.",
+      "rationale": "410 is the HTTP status for a resource that existed and is intentionally gone, and it keeps the response in the API's existing error format.",
+      "alternatives": ["404: indistinguishable from a mistyped link", "An HTML explanation page: a new presentation concern for an API service"]
+    },
+    {
+      "id": "ADR-3",
+      "title": "Two input forms, one stored form",
+      "decision": "Accept expiresAt or ttlSeconds but not both, require a time zone on expiresAt, require the result to be in the future, cap ttlSeconds at five years, and store a UTC instant.",
+      "rationale": "Campaigns end at a known time; temporary links are easier to express as a duration. Normalizing to one UTC value means the rest of the system handles a single representation. Requiring a zone avoids guessing which local time the caller meant.",
+      "alternatives": ["Only expiresAt: forces clients to compute a timestamp for simple cases", "Accept local times without a zone: ambiguous"]
+    },
+    {
+      "id": "ADR-4",
+      "title": "An expired alias stays reserved",
+      "decision": "Creating a link with the alias of an expired link returns 409 as before.",
+      "rationale": "Reuse would let anyone take over a link that is already printed, shared or bookmarked.",
+      "alternatives": ["Release the alias on expiry: convenient for owners, unsafe for visitors"]
+    },
+    {
+      "id": "ADR-5",
+      "title": "Fix BUG-17 by flushing in the close hook",
+      "decision": "ClickRecorder.close stops the timer and flushes. The onClose hook calls it inside a try/catch that logs how many events were lost if the flush fails.",
+      "rationale": "It removes the loss for every graceful shutdown, which is what a deployment is, without touching the redirect path. A failing final flush must not turn a shutdown into a hang.",
+      "alternatives": ["Write each click synchronously in the redirect: also survives a crash, but breaks the requirement that recording never slows a redirect", "Shorten the flush interval: narrows the window, does not close it"]
+    }
+  ],
+  "risks": [
+    { "id": "R-1", "risk": "The migration runs against a table with existing rows.", "likelihood": "low", "impact": "medium", "mitigation": "Adding a nullable column without a default does not rewrite rows in SQLite. A test inserts a row in the old shape and verifies it still redirects." },
+    { "id": "R-2", "risk": "A client that compares whole response bodies breaks on the added expiresAt field.", "likelihood": "low", "impact": "low", "mitigation": "The change is additive and the contract version is bumped. The service's own whole-body test is updated as part of this change." },
+    { "id": "R-3", "risk": "Clicks are still lost when the process is killed without a graceful shutdown.", "likelihood": "medium", "impact": "low", "mitigation": "Out of scope by decision Q-5; documented as a remaining limitation." },
+    { "id": "R-4", "risk": "A slow final flush delays shutdown past the platform's grace period.", "likelihood": "low", "impact": "low", "mitigation": "The buffer is bounded by CLICK_QUEUE_MAX and is written in one transaction." },
+    { "id": "R-5", "risk": "Expired links accumulate.", "likelihood": "medium", "impact": "low", "mitigation": "Accepted so that statistics remain available; cleanup is a recorded follow-up." }
+  ],
+  "requirementCoverage": [
+    { "requirementId": "FR-1", "how": "The create schema accepts both fields; resolveExpiry in the link service validates them and returns one UTC instant or null, which the repository stores." },
+    { "requirementId": "FR-2", "how": "The redirect calls LinkService.resolve, which raises link_expired (410) before any click is queued." },
+    { "requirementId": "FR-3", "how": "Metadata and statistics use LinkService.get and the stats query, neither of which checks expiry; the alias remains the primary key of a row that still exists." },
+    { "requirementId": "FR-4", "how": "ClickRecorder.close flushes, and the onClose hook calls it before the database is closed." },
+    { "requirementId": "FR-5", "how": "The column is nullable with no backfill, and NULL is treated as never expiring; responses only gain a field." }
+  ],
+  "changeEnvelope": {
+    "schemaChange": true,
+    "apiChange": "additive",
+    "newDependencies": [],
+    "touchesPersonalData": false
+  }
+}

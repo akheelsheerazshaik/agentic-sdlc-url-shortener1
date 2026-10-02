@@ -1,0 +1,19 @@
+{
+  "summary": "An additive change to a running service: one nullable column, two optional request fields, one new response status, and a shutdown fix. Existing links and clients are unaffected by construction, and that is tested with a row stored in the old shape. The first implementation attempt missed a validation rule; the independently written tests caught it and the corrected version is what is being released.",
+  "residualRisks": [
+    { "risk": "Clicks are still lost if the process is killed without a graceful shutdown.", "mitigation": "Documented limitation. Give the service a termination grace period longer than one flush." },
+    { "risk": "A strict client may reject the added expiresAt field.", "mitigation": "The field is additive and the contract version changed from 1.0.0 to 1.1.0; announce it to API consumers." },
+    { "risk": "The migration cannot be undone by the application.", "mitigation": "It only adds a nullable column, which the previous version ignores, so rolling the code back does not require rolling the schema back." }
+  ],
+  "rollbackPlan": [
+    "Redeploy the previous version of the service. It does not read expires_at and runs correctly against the migrated database.",
+    "Leave migration 002 in place: removing a column is not needed for the old code and would discard expiries already set.",
+    "Links created with an expiry while the new version was live will redirect indefinitely under the old version; list them with SELECT code FROM links WHERE expires_at IS NOT NULL and decide per link."
+  ],
+  "postReleaseChecks": [
+    "GET /readyz returns 200 and the startup log shows 002_link_expiry.sql applied.",
+    "A link that existed before the release still redirects.",
+    "Create a link with ttlSeconds, wait for it to pass, and confirm 410 with code link_expired.",
+    "Restart the service under traffic and confirm the click total matches the number of redirects served."
+  ]
+}

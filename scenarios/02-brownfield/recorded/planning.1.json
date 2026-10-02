@@ -1,0 +1,85 @@
+{
+  "approach": "Two independent slices. Expiry goes in dependency order: schema, repository, service, HTTP. The shutdown fix is confined to the click recorder and the application's close hook. The tests are written from the acceptance criteria in parallel, including regression tests that fail on the current code for BUG-17.",
+  "tasks": [
+    {
+      "id": "T-1",
+      "title": "Migration: nullable expires_at on links",
+      "lane": "code",
+      "description": "Add migration 002 with a nullable expires_at column. No backfill: NULL means the link never expires.",
+      "dependsOn": [],
+      "requirementIds": ["FR-1", "FR-5", "NFR-1"],
+      "files": ["migrations/002_link_expiry.sql"],
+      "risk": "medium"
+    },
+    {
+      "id": "T-2",
+      "title": "Store and read the expiry",
+      "lane": "code",
+      "description": "Write expires_at on insert and return it on lookup.",
+      "dependsOn": ["T-1"],
+      "requirementIds": ["FR-1", "FR-3", "FR-5"],
+      "files": ["src/links/linkRepository.ts"],
+      "risk": "low"
+    },
+    {
+      "id": "T-3",
+      "title": "Expiry rules in the link service",
+      "lane": "code",
+      "description": "Turn expiresAt or ttlSeconds into a UTC expiry with validation, add a resolve operation that rejects an expired link with a link_expired error, and keep the plain lookup for metadata.",
+      "dependsOn": ["T-2"],
+      "requirementIds": ["FR-1", "FR-2", "FR-3", "NFR-2"],
+      "files": ["src/links/linkService.ts", "src/domain/errors.ts"],
+      "risk": "medium"
+    },
+    {
+      "id": "T-4",
+      "title": "Expiry in the HTTP API",
+      "lane": "code",
+      "description": "Accept expiresAt and ttlSeconds on create, return expiresAt, and use the resolve operation for redirects.",
+      "dependsOn": ["T-3"],
+      "requirementIds": ["FR-1", "FR-2", "FR-5"],
+      "files": ["src/http/routes.ts"],
+      "risk": "low"
+    },
+    {
+      "id": "T-5",
+      "title": "BUG-17: flush buffered clicks on shutdown",
+      "lane": "code",
+      "description": "Closing the click recorder writes the remaining buffer; the application's close hook calls it and logs, rather than propagates, a failure.",
+      "dependsOn": [],
+      "requirementIds": ["FR-4"],
+      "files": ["src/analytics/clickRecorder.ts", "src/app.ts"],
+      "risk": "medium"
+    },
+    {
+      "id": "T-6",
+      "title": "Tests for link expiry and compatibility",
+      "lane": "test",
+      "description": "API tests for every expiry criterion with a controlled clock, boundary tests for the expiry check, a test that a row stored before the migration still works, and the update to the existing whole-body assertion.",
+      "dependsOn": [],
+      "requirementIds": ["FR-1", "FR-2", "FR-3", "FR-5"],
+      "files": ["test/integration/expiry.api.test.ts", "test/unit/linkExpiry.test.ts", "test/integration/links.api.test.ts"],
+      "risk": "low"
+    },
+    {
+      "id": "T-7",
+      "title": "Regression tests for BUG-17",
+      "lane": "test",
+      "description": "Tests that record clicks, close the application with the flush timer effectively disabled, and assert the clicks are in the database; and that shutdown still completes when the final write fails.",
+      "dependsOn": [],
+      "requirementIds": ["FR-4"],
+      "files": ["test/integration/shutdown.test.ts", "test/unit/clickRecorder.test.ts"],
+      "risk": "low"
+    },
+    {
+      "id": "T-8",
+      "title": "Update the README and the OpenAPI contract",
+      "lane": "docs",
+      "description": "Document the expiry fields, the 410 response and the corrected shutdown behaviour, including what is still lost on an abrupt kill.",
+      "dependsOn": [],
+      "requirementIds": ["FR-1", "FR-2", "FR-4"],
+      "files": ["README.md", "openapi.yaml"],
+      "risk": "low"
+    }
+  ]
+}

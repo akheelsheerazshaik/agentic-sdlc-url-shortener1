@@ -1,0 +1,162 @@
+{
+  "approach": "Two slices that share only the redirect route. Destination safety: a pure host-rules module, used by URL validation on create and again when a link is resolved. Device analytics: schema first, then classify at the route, record, aggregate. Tests are written from the acceptance criteria in parallel with the code.",
+  "tasks": [
+    {
+      "id": "T-1",
+      "title": "Migration: device_class on click_events",
+      "lane": "code",
+      "description": "Add migration 003 with a not-null device_class column defaulting to 'unknown' and restricted to the five classes.",
+      "dependsOn": [],
+      "requirementIds": [
+        "FR-4",
+        "NFR-1"
+      ],
+      "files": [
+        "migrations/003_click_device_class.sql"
+      ],
+      "risk": "medium"
+    },
+    {
+      "id": "T-2",
+      "title": "Host rules and destination validation",
+      "lane": "code",
+      "description": "A module that decides whether a host is internal (address ranges in any notation, localhost, single-label and internal-suffix names) or on the denylist, and its use in destination URL validation.",
+      "dependsOn": [],
+      "requirementIds": [
+        "FR-1",
+        "FR-2",
+        "NFR-3"
+      ],
+      "files": [
+        "src/domain/hostRules.ts",
+        "src/domain/urlPolicy.ts"
+      ],
+      "risk": "medium"
+    },
+    {
+      "id": "T-3",
+      "title": "DENIED_HOSTS configuration",
+      "lane": "code",
+      "description": "Parse and validate the comma-separated denylist at startup.",
+      "dependsOn": [
+        "T-2"
+      ],
+      "requirementIds": [
+        "FR-2"
+      ],
+      "files": [
+        "src/config.ts"
+      ],
+      "risk": "low"
+    },
+    {
+      "id": "T-4",
+      "title": "Enforce the destination rules on redirect",
+      "lane": "code",
+      "description": "Re-check the stored destination when a link is resolved and answer with a link_blocked error; wire the denylist into the link service.",
+      "dependsOn": [
+        "T-2",
+        "T-3"
+      ],
+      "requirementIds": [
+        "FR-3",
+        "NFR-3"
+      ],
+      "files": [
+        "src/links/linkService.ts",
+        "src/domain/errors.ts",
+        "src/app.ts"
+      ],
+      "risk": "medium"
+    },
+    {
+      "id": "T-5",
+      "title": "Classify the device and record it with each click",
+      "lane": "code",
+      "description": "Reduce the User-Agent header to a device class at the redirect route and store only the class with the click event.",
+      "dependsOn": [
+        "T-1"
+      ],
+      "requirementIds": [
+        "FR-4",
+        "NFR-1"
+      ],
+      "files": [
+        "src/analytics/deviceClass.ts",
+        "src/analytics/clickRecorder.ts",
+        "src/http/routes.ts"
+      ],
+      "risk": "medium"
+    },
+    {
+      "id": "T-6",
+      "title": "Device breakdown in statistics",
+      "lane": "code",
+      "description": "Report clicks per device class in a fixed order.",
+      "dependsOn": [
+        "T-5"
+      ],
+      "requirementIds": [
+        "FR-4",
+        "NFR-2"
+      ],
+      "files": [
+        "src/analytics/statsService.ts"
+      ],
+      "risk": "low"
+    },
+    {
+      "id": "T-7",
+      "title": "Tests for destination safety",
+      "lane": "test",
+      "description": "Rule tests covering every address range and notation, and API tests for create and for redirect after the denylist changes.",
+      "dependsOn": [],
+      "requirementIds": [
+        "FR-1",
+        "FR-2",
+        "FR-3"
+      ],
+      "files": [
+        "test/unit/hostRules.test.ts",
+        "test/unit/urlPolicy.test.ts",
+        "test/integration/safety.api.test.ts"
+      ],
+      "risk": "low"
+    },
+    {
+      "id": "T-8",
+      "title": "Tests for device analytics",
+      "lane": "test",
+      "description": "Classification tests with real User-Agent strings, statistics tests for the breakdown, and a test that the header is never stored.",
+      "dependsOn": [],
+      "requirementIds": [
+        "FR-4",
+        "NFR-1"
+      ],
+      "files": [
+        "test/unit/deviceClass.test.ts",
+        "test/integration/stats.api.test.ts",
+        "test/unit/clickRecorder.test.ts"
+      ],
+      "risk": "low"
+    },
+    {
+      "id": "T-9",
+      "title": "Update the README and the OpenAPI contract",
+      "lane": "docs",
+      "description": "Document the destination rules and their limits, the new setting, the statistics fields and what is and is not stored.",
+      "dependsOn": [],
+      "requirementIds": [
+        "FR-1",
+        "FR-2",
+        "FR-3",
+        "FR-4"
+      ],
+      "files": [
+        "README.md",
+        "openapi.yaml"
+      ],
+      "risk": "low"
+    }
+  ]
+}

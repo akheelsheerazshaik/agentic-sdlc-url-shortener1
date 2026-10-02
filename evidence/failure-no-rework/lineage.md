@@ -1,0 +1,95 @@
+# Decisions, lineage and timeline
+
+## Decisions made by agents
+
+| Stage | Gen | Decision | Rationale | Alternatives considered |
+| --- | --- | --- | --- | --- |
+| requirements | 1 | "told the link has expired rather than that it never existed": 410 Gone as a problem document with code link_expired, consistent with the API's existing error format. | Default assumption. It is a public contract that clients and monitoring will depend on. | 410 Gone with error code link_expired; 404 with a different message; An HTML page explaining the expiry |
+| requirements | 1 | "After that moment": The link is expired from its expiry instant onwards. | Default assumption. The boundary has to be defined for the tests to be exact and for clients to predict behaviour. | Expired from the instant onwards; Still valid at the instant, expired after it |
+| requirements | 1 | "a time-to-live in seconds": A positive whole number of seconds, at most five years. | Default assumption. An unbounded integer invites overflow and nonsensical dates. | Maximum of five years; No maximum |
+| requirements | 1 | "must no longer redirect": The alias stays reserved, to prevent takeover of an expired link. | Default assumption. If it can, someone else can register the alias of a link people already trust and send its visitors anywhere. | The alias stays reserved; The alias becomes available again |
+| requirements | 1 | "just before a restart": Graceful shutdown only, which is what a deployment is. Loss on an abrupt kill remains and is documented. | Default assumption. A deployment sends SIGTERM and is a graceful shutdown. Surviving an abrupt kill needs every click written durably before the redirect returns, which contradicts the existing requirement that recording a click never slows a redirect. | Graceful shutdown only; Also survive a crash, by writing each click synchronously |
+| planning | 1 | Deliver in 8 tasks | Two independent slices. Expiry goes in dependency order: schema, repository, service, HTTP. The shutdown fix is confined to the click recorder and the application's close hook. The tests are written from the acceptance criteria in parallel, including regression tests that fail on the current code for BUG-17. | - |
+| architecture | 1 | ADR-1 Enforce expiry when resolving, and keep the row: Store the expiry on the link and compare it with the current time in LinkService.resolve. Expired rows are not deleted. | The owner must still read the stats of an expired link, and the visitor must be told it expired rather than that it never existed. Both need the row to remain. The check reuses the row the redirect already loads. | A background job that deletes expired links: loses the statistics and turns expiry into a 404; Filter expired rows in the SQL WHERE clause: cannot tell expired from unknown, so it cannot answer 410 |
+| architecture | 1 | ADR-2 410 Gone with a link_expired code: An expired link's redirect answers 410 as a problem document with code link_expired, and sends no Location header. | 410 is the HTTP status for a resource that existed and is intentionally gone, and it keeps the response in the API's existing error format. | 404: indistinguishable from a mistyped link; An HTML explanation page: a new presentation concern for an API service |
+| architecture | 1 | ADR-3 Two input forms, one stored form: Accept expiresAt or ttlSeconds but not both, require a time zone on expiresAt, require the result to be in the future, cap ttlSeconds at five years, and store a UTC instant. | Campaigns end at a known time; temporary links are easier to express as a duration. Normalizing to one UTC value means the rest of the system handles a single representation. Requiring a zone avoids guessing which local time the caller meant. | Only expiresAt: forces clients to compute a timestamp for simple cases; Accept local times without a zone: ambiguous |
+| architecture | 1 | ADR-4 An expired alias stays reserved: Creating a link with the alias of an expired link returns 409 as before. | Reuse would let anyone take over a link that is already printed, shared or bookmarked. | Release the alias on expiry: convenient for owners, unsafe for visitors |
+| architecture | 1 | ADR-5 Fix BUG-17 by flushing in the close hook: ClickRecorder.close stops the timer and flushes. The onClose hook calls it inside a try/catch that logs how many events were lost if the flush fails. | It removes the loss for every graceful shutdown, which is what a deployment is, without touching the redirect path. A failing final flush must not turn a shutdown into a hang. | Write each click synchronously in the redirect: also survives a crash, but breaks the requirement that recording never slows a redirect; Shorten the flush interval: narrows the window, does not close it |
+
+## Artifact versions
+
+| Artifact | Version | Status | Hash | Produced by | Stage (generation) |
+| --- | --- | --- | --- | --- | --- |
+| requirement | v1 | accepted | `5cfa836f8989` | requester | run-creation (0) |
+| baseline-index | v1 | accepted | `fce56ec2be03` | orchestrator | run-creation (0) |
+| requirement-spec | v1 | accepted | `7923bb6d3661` | agent:requirements | requirements (1) |
+| impact-report | v1 | accepted | `653c7e9a2676` | agent:impact-analysis | impact-analysis (1) |
+| plan | v1 | accepted | `50739c6147d7` | agent:planning | planning (1) |
+| design | v1 | accepted | `8e8ba307ceea` | agent:architecture | architecture (1) |
+| code-changes | v1 | accepted | `21697a8421fa` | agent:implementation | implementation (1) |
+| doc-changes | v1 | accepted | `bc39411227bc` | agent:documentation | documentation (1) |
+| test-changes | v1 | accepted | `fc1e36687122` | agent:test-design | test-design (1) |
+| workspace-state | v1 | accepted | `766d5ee2bc65` | agent:integrator | integrate (1) |
+| policy-report | v1 | accepted | `b7529a0c45ee` | agent:policy-reviewer | policy-review (1) |
+| test-report | v1 | rejected | `821c612fa88a` | agent:build-verifier | build-verify (1) |
+
+## Lineage of `workspace-state`
+
+Each line was derived from the lines indented beneath it. A line ending in … is expanded where it first appears.
+
+```
+workspace-state v1 [766d5ee2bc65] by agent:integrator (integrate, generation 1)
+  code-changes v1 [21697a8421fa] by agent:implementation (implementation, generation 1)
+    design v1 [8e8ba307ceea] by agent:architecture (architecture, generation 1)
+      impact-report v1 [653c7e9a2676] by agent:impact-analysis (impact-analysis, generation 1)
+        baseline-index v1 [fce56ec2be03] by orchestrator (run-creation, generation 0)
+        requirement-spec v1 [7923bb6d3661] by agent:requirements (requirements, generation 1)
+          baseline-index v1 [fce56ec2be03] by orchestrator (run-creation, generation 0) …
+          requirement v1 [5cfa836f8989] by requester (run-creation, generation 0)
+      plan v1 [50739c6147d7] by agent:planning (planning, generation 1)
+        impact-report v1 [653c7e9a2676] by agent:impact-analysis (impact-analysis, generation 1) …
+        requirement-spec v1 [7923bb6d3661] by agent:requirements (requirements, generation 1) …
+      requirement-spec v1 [7923bb6d3661] by agent:requirements (requirements, generation 1) …
+    impact-report v1 [653c7e9a2676] by agent:impact-analysis (impact-analysis, generation 1) …
+    plan v1 [50739c6147d7] by agent:planning (planning, generation 1) …
+    requirement-spec v1 [7923bb6d3661] by agent:requirements (requirements, generation 1) …
+  design v1 [8e8ba307ceea] by agent:architecture (architecture, generation 1) …
+  doc-changes v1 [bc39411227bc] by agent:documentation (documentation, generation 1)
+    design v1 [8e8ba307ceea] by agent:architecture (architecture, generation 1) …
+    impact-report v1 [653c7e9a2676] by agent:impact-analysis (impact-analysis, generation 1) …
+    plan v1 [50739c6147d7] by agent:planning (planning, generation 1) …
+    requirement-spec v1 [7923bb6d3661] by agent:requirements (requirements, generation 1) …
+  plan v1 [50739c6147d7] by agent:planning (planning, generation 1) …
+  test-changes v1 [fc1e36687122] by agent:test-design (test-design, generation 1)
+    design v1 [8e8ba307ceea] by agent:architecture (architecture, generation 1) …
+    impact-report v1 [653c7e9a2676] by agent:impact-analysis (impact-analysis, generation 1) …
+    plan v1 [50739c6147d7] by agent:planning (planning, generation 1) …
+    requirement-spec v1 [7923bb6d3661] by agent:requirements (requirements, generation 1) …
+```
+
+## Timeline
+
+Selected events from `audit.jsonl`.
+
+| # | Time | Event | Stage | Actor | Detail |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 00:56:50.668 | RUN_CREATED |  | engine:orchestrator | scenario: brownfield · mode: offline |
+| 4 | 00:56:50.671 | RUN_STARTED |  | engine:orchestrator |  |
+| 16 | 00:56:50.678 | STAGE_SUCCEEDED | requirements | engine:orchestrator |  |
+| 21 | 00:56:50.680 | STAGE_SUCCEEDED | impact-analysis | engine:orchestrator |  |
+| 28 | 00:56:50.681 | STAGE_SUCCEEDED | planning | engine:orchestrator |  |
+| 38 | 00:56:50.683 | APPROVAL_REQUESTED | architecture | engine:orchestrator | reasons: The design changes the database schema.; The design changes the public API (additive). · kind: approval |
+| 39 | 00:56:50.683 | RUN_PAUSED |  | engine:orchestrator | waitingOn: architecture |
+| 40 | 00:56:50.773 | APPROVAL_RECORDED | architecture | human:demo-reviewer | decision: approved |
+| 42 | 00:56:50.774 | STAGE_SUCCEEDED | architecture | engine:orchestrator |  |
+| 43 | 00:56:50.861 | RUN_RESUMED |  | engine:orchestrator |  |
+| 55 | 00:56:50.872 | STAGE_SUCCEEDED | implementation | engine:orchestrator |  |
+| 57 | 00:56:50.873 | STAGE_SUCCEEDED | documentation | engine:orchestrator |  |
+| 59 | 00:56:50.873 | STAGE_SUCCEEDED | test-design | engine:orchestrator |  |
+| 64 | 00:56:50.884 | STAGE_SUCCEEDED | integrate | engine:orchestrator |  |
+| 69 | 00:56:50.890 | STAGE_SUCCEEDED | policy-review | engine:orchestrator |  |
+| 72 | 00:56:52.992 | STAGE_ATTEMPT_FAILED | build-verify | agent:build-verifier | error: still failing after 0 rework loop(s): [build-green] test failed: test/integration/expiry.api.test.ts > link expiry creating a link rejects an expiry in the past with 400: AssertionError: expected 201 to be 400 ... |
+| 73 | 00:56:52.992 | STAGE_FAILED | build-verify | engine:orchestrator | error: all attempts failed. Last error: still failing after 0 rework loop(s): [build-green] test failed: test/integration/expiry.api.test.ts > link expiry creating a link rejects an expiry in the past with 400: Assert... |
+| 74 | 00:56:52.993 | ROLLBACK_STARTED |  | engine:orchestrator | stages: integrate |
+| 75 | 00:56:52.995 | COMPENSATION_EXECUTED | integrate | engine:orchestrator |  |
+| 76 | 00:56:52.995 | RUN_SAFE_STOPPED |  | engine:orchestrator | reason: Stage "build-verify" failed: all attempts failed. Last error: still failing after 0 rework loop(s): [build-green] test failed: test/integration/expiry.api.test.ts > link expiry creating a link rejects an expir... |

@@ -1,0 +1,202 @@
+{
+  "overview": "Destination safety is a pure function of a URL and the operator's denylist, placed beside the existing URL rules. It runs in two places: when a link is created, and when a stored link is resolved for a redirect, which is how existing links are covered without touching their rows.\n\nDevice analytics extends the existing click path by one value. The redirect route reduces the User-Agent header to a device class and hands the class, not the header, to the click recorder. The class is stored with the click event and aggregated by the statistics service. Automated traffic is reported beside the total rather than removed from it.",
+  "components": [
+    {
+      "name": "Host rules",
+      "responsibility": "Internal-host detection, denylist matching, denylist parsing. No I/O.",
+      "files": [
+        "src/domain/hostRules.ts"
+      ]
+    },
+    {
+      "name": "URL policy",
+      "responsibility": "Apply the host rules on create, and expose the re-check used on redirect.",
+      "files": [
+        "src/domain/urlPolicy.ts"
+      ]
+    },
+    {
+      "name": "Configuration and wiring",
+      "responsibility": "Read and validate DENIED_HOSTS; pass it to the link service.",
+      "files": [
+        "src/config.ts",
+        "src/app.ts"
+      ]
+    },
+    {
+      "name": "Link service",
+      "responsibility": "Validate against the denylist on create; block a disallowed stored destination on resolve.",
+      "files": [
+        "src/links/linkService.ts",
+        "src/domain/errors.ts"
+      ]
+    },
+    {
+      "name": "Device classification",
+      "responsibility": "Map a User-Agent header to one of five classes.",
+      "files": [
+        "src/analytics/deviceClass.ts"
+      ]
+    },
+    {
+      "name": "Click path",
+      "responsibility": "Classify at the route, store the class with the event, aggregate by class.",
+      "files": [
+        "src/http/routes.ts",
+        "src/analytics/clickRecorder.ts",
+        "src/analytics/statsService.ts",
+        "migrations/003_click_device_class.sql"
+      ]
+    }
+  ],
+  "apiChanges": [
+    {
+      "operation": "POST /api/v1/links",
+      "change": "Destinations on internal or denied hosts now return 400."
+    },
+    {
+      "operation": "GET /{code}",
+      "change": "New 410 reason: code link_blocked."
+    },
+    {
+      "operation": "GET /api/v1/links/{code}/stats",
+      "change": "Response adds clicksByDevice, botClicks and nonBotClicks."
+    }
+  ],
+  "dataModelChanges": [
+    "click_events.device_class TEXT NOT NULL DEFAULT 'unknown', constrained to desktop, mobile, tablet, bot, unknown."
+  ],
+  "decisions": [
+    {
+      "id": "ADR-1",
+      "title": "Judge a destination by its text, without resolving DNS",
+      "decision": "Parse the URL and test its host: address literals against the non-public ranges, names against localhost, single-label and internal suffixes, and the operator's denylist. No DNS lookup is made.",
+      "rationale": "The standard URL parser already turns disguised forms such as 2130706433 or 0x7f.1 into a dotted address, so a text check catches them. A DNS lookup would put a network call driven by user input on both the create and the redirect path, and the answer can change between the check and the visit.",
+      "alternatives": [
+        "Resolve the name and check the addresses: catches public names pointing at private addresses, at the cost of latency, a network dependency and a time-of-check gap",
+        "Call a reputation service: an external dependency, and it sends every submitted URL to a third party"
+      ]
+    },
+    {
+      "id": "ADR-2",
+      "title": "Re-check the destination on every redirect",
+      "decision": "LinkService.resolve applies the same rules to the stored URL that create applies to a new one.",
+      "rationale": "The requester confirmed that existing links must be covered. Checking at redirect time means a denylist change takes effect immediately for every link, with no migration or batch job, and it costs one URL parse on a row already loaded.",
+      "alternatives": [
+        "A one-off job that marks existing links as blocked: has to be re-run on every denylist change, and adds state that can go stale",
+        "Check only on create: leaves every existing unsafe link live"
+      ]
+    },
+    {
+      "id": "ADR-3",
+      "title": "A blocked link answers 410 with link_blocked and reveals nothing",
+      "decision": "Return 410 as a problem document with code link_blocked, no Location header, and a message that does not contain the destination.",
+      "rationale": "It matches how an expired link is reported, so clients handle one more code rather than a new mechanism. Withholding the destination avoids advertising the unsafe URL.",
+      "alternatives": [
+        "An interstitial warning page with a continue button: still delivers people to the destination",
+        "404: hides from the owner that the link was blocked rather than lost"
+      ]
+    },
+    {
+      "id": "ADR-4",
+      "title": "Store a coarse device class, never the User-Agent",
+      "decision": "Classify the header in memory at the redirect route into one of five classes and store only that class with the click.",
+      "rationale": "The requester confirmed that nothing identifying a visitor may be stored. A raw User-Agent, especially combined with a timestamp and a referrer, can single out a person; one of five class names cannot.",
+      "alternatives": [
+        "Store the header and classify when reporting: flexible, but holds personal data",
+        "Store a hash of address and User-Agent to count unique visitors: a persistent visitor identifier, ruled out by Q-1"
+      ]
+    },
+    {
+      "id": "ADR-5",
+      "title": "Classify with a small set of patterns in-process",
+      "decision": "A handful of regular expressions over the first 512 characters of the header, with bots tested first.",
+      "rationale": "Five coarse classes do not need a device database. No new dependency enters the build, and bounding the inspected length bounds the cost of an oversized header.",
+      "alternatives": [
+        "A User-Agent parsing library: more accurate for browser and OS detail nobody asked for, and a new dependency to approve and keep patched"
+      ]
+    },
+    {
+      "id": "ADR-6",
+      "title": "Report bot and non-bot clicks beside the total, and leave the total alone",
+      "decision": "Add botClicks and nonBotClicks to the statistics. totalClicks keeps counting every recorded click and always equals their sum. The second figure is named nonBotClicks, not humanClicks.",
+      "rationale": "The reviewer asked that automated traffic not inflate campaign numbers. Changing what totalClicks means would silently alter every existing report and dashboard. The name is deliberate: the figure includes clicks of unknown class and bots that pose as browsers, so calling it human would overstate what is known.",
+      "alternatives": [
+        "Exclude bots from totalClicks: simpler to read, but changes the meaning of an existing field",
+        "Do not record bot clicks at all: loses the ability to see how much traffic is automated"
+      ]
+    }
+  ],
+  "risks": [
+    {
+      "id": "R-1",
+      "risk": "A public host name that resolves to a private address is not detected.",
+      "likelihood": "medium",
+      "impact": "medium",
+      "mitigation": "Accepted and documented under ADR-1. The service never fetches the destination itself, so this is not a server-side request forgery path; the exposure is a visitor inside a network being sent to an internal address."
+    },
+    {
+      "id": "R-2",
+      "risk": "The denylist is only as good as its maintenance.",
+      "likelihood": "high",
+      "impact": "medium",
+      "mitigation": "Documented as a first measure. A reputation feed is a recorded follow-up."
+    },
+    {
+      "id": "R-3",
+      "risk": "An over-broad denylist entry blocks legitimate links, including existing ones, immediately.",
+      "likelihood": "low",
+      "impact": "high",
+      "mitigation": "Entries are validated as host names at startup; matching is by host and subdomain only, never by substring. Removing the entry restores the links at once because nothing is stored."
+    },
+    {
+      "id": "R-4",
+      "risk": "Device classes are heuristic: a bot that sends a browser's User-Agent is counted as that browser, and recent iPads identify as desktop.",
+      "likelihood": "high",
+      "impact": "low",
+      "mitigation": "Documented. The class named bot is defined as clients that identify themselves as automated."
+    },
+    {
+      "id": "R-5",
+      "risk": "Adding a constrained not-null column validates existing click_events rows during the migration.",
+      "likelihood": "low",
+      "impact": "medium",
+      "mitigation": "The default satisfies the constraint for every row. On a very large table the migration should be run in a maintenance window."
+    },
+    {
+      "id": "R-6",
+      "risk": "Creation requests that used to succeed are now rejected.",
+      "likelihood": "medium",
+      "impact": "low",
+      "mitigation": "This is the intent of the change. The error message states that the destination is not allowed."
+    }
+  ],
+  "requirementCoverage": [
+    {
+      "requirementId": "FR-1",
+      "how": "normalizeTargetUrl rejects a destination whose host isInternalHost reports as internal."
+    },
+    {
+      "requirementId": "FR-2",
+      "how": "The same function rejects a host that isDeniedHost matches against the configured list; parseDeniedHosts validates the setting at startup."
+    },
+    {
+      "requirementId": "FR-3",
+      "how": "LinkService.resolve calls isAllowedDestination on the stored URL and raises link_blocked before any click is queued."
+    },
+    {
+      "requirementId": "FR-4",
+      "how": "The redirect route calls classifyDevice, the recorder stores the class, and StatsService groups click_events by it and reports every class."
+    },
+    {
+      "requirementId": "FR-5",
+      "how": "StatsService reports the bot class count as botClicks and totalClicks minus it as nonBotClicks; classifyDevice tests for self-identified automation first."
+    }
+  ],
+  "changeEnvelope": {
+    "schemaChange": true,
+    "apiChange": "additive",
+    "newDependencies": [],
+    "touchesPersonalData": true
+  }
+}

@@ -1,0 +1,1000 @@
+===================================================================
+--- a/README.md
++++ b/README.md
+@@ -32,10 +32,10 @@
+ | Method | Path | Purpose |
+ | --- | --- | --- |
+ | `POST` | `/api/v1/links` | Create a link, optionally with a custom alias and an expiry |
+ | `GET` | `/api/v1/links/{code}` | Read a link, expired or not |
+-| `GET` | `/api/v1/links/{code}/stats` | Total clicks, clicks per day, top referrers |
+-| `GET` | `/{code}` | Redirect to the target (`302`, never cached); `410` once expired |
++| `GET` | `/api/v1/links/{code}/stats` | Total, bot and non-bot clicks; clicks per device class, per day, and top referrers |
++| `GET` | `/{code}` | Redirect to the target (`302`, never cached); `410` once expired or blocked |
+ | `GET` | `/healthz`, `/readyz` | Liveness and readiness probes |
+ 
+ Errors are RFC 9457 problem documents (`application/problem+json`) with a stable `code` field.
+ 
+@@ -46,8 +46,9 @@
+ | `HOST` | `127.0.0.1` | Bind address |
+ | `PORT` | `3000` | Listen port |
+ | `PUBLIC_BASE_URL` | `http://localhost:3000` | Base of the short URLs returned to clients |
+ | `DATABASE_PATH` | `./data/shortener.db` | SQLite file |
++| `DENIED_HOSTS` | empty | Comma-separated hosts links may not point to; subdomains are denied too |
+ | `TRUST_PROXY` | `false` | Set `true` only behind a trusted reverse proxy |
+ | `RATE_LIMIT_CAPACITY` | `20` | Burst size per client for `/api/*` |
+ | `RATE_LIMIT_REFILL_PER_SECOND` | `1` | Sustained requests per second per client |
+ | `CLICK_FLUSH_INTERVAL_MS` | `1000` | How often buffered clicks are written |
+@@ -59,20 +60,24 @@
+ ## Design notes
+ 
+ - **Layers.** `http/` handles requests, `links/` and `analytics/` hold the logic, `db/` owns SQLite. Only the repository and analytics classes contain SQL, and every statement is parameterized.
+ - **Codes.** Seven random base62 characters from a cryptographic source. Uniqueness is enforced by the primary key: insert, and retry on a clash.
+-- **Destination rules.** Only `http` and `https`, no embedded credentials, at most 2048 characters, and never a link back to this service.
++- **Destination rules.** Only `http` and `https`, no embedded credentials, at most 2048 characters, and never a link back to this service. Internal destinations are refused: loopback, private, link-local and carrier-NAT addresses in any notation, `localhost`, single-label names, and `.local`/`.internal`-style suffixes. Hosts in `DENIED_HOSTS` are refused along with their subdomains.
++- **Safety at redirect time.** The same destination rules run again on every redirect, so adding a host to the denylist also stops links that already point there. A blocked link returns `410 Gone` (`link_blocked`), sends no `Location`, and records no click.
+ - **Expiry.** A link may be created with `expiresAt` (absolute, with a time zone) or `ttlSeconds` (relative), not both. From that instant the redirect returns `410 Gone` and records no click. Metadata and stats stay readable, and the alias stays reserved so an expired link cannot be taken over.
+ - **Redirects** use `302` with `Cache-Control: no-store`, so every click reaches the service and is counted.
+ - **Click recording** is decoupled from the redirect. A redirect pushes an event onto a bounded in-memory queue; a timer writes batches in one transaction together with the running totals. On graceful shutdown the remaining events are written before the database closes.
+ - **Rate limiting** is a per-client token bucket on `/api/*`. Redirects are not limited.
+-- **Privacy.** Only the referrer's host is stored. Request logs contain the method and path, not the client address.
++- **Device analytics.** Each click is tagged `desktop`, `mobile`, `tablet`, `bot` or `unknown`, derived from the `User-Agent` header at request time. Stats report the breakdown, plus `botClicks` and `nonBotClicks`, so automated traffic does not inflate campaign numbers.
++- **Privacy.** No personal data is stored: no client address, no `User-Agent` header (only the device class), and only the referrer's host. There are no per-visitor identifiers, so the service cannot count unique visitors. Request logs contain the method and path, not the client address.
+ - **Migrations** are plain SQL files applied in order. An applied file may not change; the stored checksum is verified at startup.
+ 
+ ## Known limitations
+ 
+ - Clicks are dropped when the queue is full, and clicks still buffered when the process is killed without a graceful shutdown (`SIGKILL`, crash, power loss) are lost. Analytics are best-effort by design.
+ - Expired links are kept, not deleted, so their stats remain available.
++- Destination checks look at the URL's text and do not resolve DNS: a public name that points at a private address is not detected, and there is no reputation feed behind the denylist.
++- Device classes are a heuristic. A bot that sends a browser's `User-Agent` is counted as that browser, and recent iPads identify as desktop Safari.
+ - The API has no authentication: anyone who can reach it can create links and read stats.
+ - Rate limits and the click queue live in one process. Running several instances needs a shared store.
+ - SQLite is a single-writer, single-node database.
+ - `node:sqlite` prints an experimental-feature warning on current Node.js releases.
+
+===================================================================
+--- /dev/null
++++ b/migrations/003_click_device_class.sql
+@@ -0,0 +1,7 @@
++-- 003: coarse device class per click.
++-- Clicks recorded before this migration have no class and are reported as 'unknown'.
++-- Only the class is stored. The User-Agent header it is derived from is never persisted.
++
++ALTER TABLE click_events
++  ADD COLUMN device_class TEXT NOT NULL DEFAULT 'unknown'
++  CHECK (device_class IN ('desktop', 'mobile', 'tablet', 'bot', 'unknown'));
+
+===================================================================
+--- a/openapi.yaml
++++ b/openapi.yaml
+@@ -1,8 +1,8 @@
+ openapi: 3.1.0
+ info:
+   title: URL Shortener API
+-  version: 1.1.0
++  version: 1.2.0
+   description: Create short links, redirect to their targets, and read click analytics.
+ servers:
+   - url: http://localhost:3000
+ paths:
+@@ -95,9 +95,11 @@
+                 const: no-store
+         '404':
+           $ref: '#/components/responses/Problem'
+         '410':
+-          description: The link has expired. No Location header is sent and no click is recorded.
++          description: >-
++            The link has expired (code `link_expired`) or its destination is no longer allowed
++            (code `link_blocked`). No Location header is sent and no click is recorded.
+           content:
+             application/problem+json:
+               schema:
+                 $ref: '#/components/schemas/Problem'
+@@ -153,9 +155,11 @@
+         url:
+           type: string
+           format: uri
+           maxLength: 2048
+-          description: Absolute http or https URL, without embedded credentials.
++          description: >-
++            Absolute http or https URL, without embedded credentials. Internal addresses and host names,
++            and hosts on the operator's denylist, are rejected.
+         alias:
+           type: string
+           pattern: '^[a-z0-9][a-z0-9_-]{2,31}$'
+           description: Optional custom code. Lowercase only; some names are reserved.
+@@ -190,15 +194,38 @@
+           format: date-time
+           description: Expiry instant in UTC, or null if the link never expires.
+     LinkStats:
+       type: object
+-      required: [code, totalClicks, clicksByDay, topReferrers]
++      required: [code, totalClicks, botClicks, nonBotClicks, clicksByDevice, clicksByDay, topReferrers]
+       properties:
+         code:
+           type: string
+         totalClicks:
+           type: integer
+           minimum: 0
++          description: All recorded clicks. Always botClicks + nonBotClicks.
++        botClicks:
++          type: integer
++          minimum: 0
++          description: Clicks from clients that identified themselves as automated.
++        nonBotClicks:
++          type: integer
++          minimum: 0
++          description: >-
++            Clicks not identified as automated. Includes clicks of unknown device class, and automated
++            clients that present a browser User-Agent.
++        clicksByDevice:
++          type: array
++          description: One entry per device class, in a fixed order, including classes with no clicks.
++          items:
++            type: object
++            required: [device, clicks]
++            properties:
++              device:
++                type: string
++                enum: [desktop, mobile, tablet, bot, unknown]
++              clicks:
++                type: integer
+         clicksByDay:
+           type: array
+           description: Clicks per UTC day over the last 30 days, oldest first. Days without clicks are omitted.
+           items:
+
+===================================================================
+--- a/src/analytics/clickRecorder.ts
++++ b/src/analytics/clickRecorder.ts
+@@ -1,11 +1,13 @@
+ import type { StatementSync } from 'node:sqlite';
+ import { inTransaction, type Database } from '../db/database.ts';
++import type { DeviceClass } from './deviceClass.ts';
+ 
+ export interface ClickEvent {
+   code: string;
+   clickedAt: string;
+   referrerHost: string | null;
++  deviceClass: DeviceClass;
+ }
+ 
+ export interface ClickRecorderOptions {
+   flushIntervalMs: number;
+@@ -32,9 +34,9 @@
+   constructor(db: Database, options: ClickRecorderOptions) {
+     this.db = db;
+     this.options = options;
+     this.insertEvent = db.prepare(
+-      'INSERT INTO click_events (code, clicked_at, referrer_host) VALUES (?, ?, ?)',
++      'INSERT INTO click_events (code, clicked_at, referrer_host, device_class) VALUES (?, ?, ?, ?)',
+     );
+     this.incrementCount = db.prepare('UPDATE links SET click_count = click_count + ? WHERE code = ?');
+   }
+ 
+@@ -55,9 +57,9 @@
+     const perCode = new Map<string, number>();
+     try {
+       inTransaction(this.db, () => {
+         for (const event of batch) {
+-          this.insertEvent.run(event.code, event.clickedAt, event.referrerHost);
++          this.insertEvent.run(event.code, event.clickedAt, event.referrerHost, event.deviceClass);
+           perCode.set(event.code, (perCode.get(event.code) ?? 0) + 1);
+         }
+         for (const [code, count] of perCode) {
+           this.incrementCount.run(count, code);
+
+===================================================================
+--- /dev/null
++++ b/src/analytics/deviceClass.ts
+@@ -0,0 +1,33 @@
++export const DEVICE_CLASSES = ['desktop', 'mobile', 'tablet', 'bot', 'unknown'] as const;
++export type DeviceClass = (typeof DEVICE_CLASSES)[number];
++
++/** Only the start of the header is inspected, which bounds the work an oversized header can cause. */
++const MAX_INSPECTED_LENGTH = 512;
++
++const BOT = /bot\b|crawl|spider|slurp|preview|monitor|fetch|scrape|headless|curl\/|wget\/|python-|java\/|go-http-client|okhttp|axios|node-fetch|facebookexternalhit/i;
++const TABLET = /ipad|tablet|kindle|silk\/|playbook/i;
++const MOBILE = /mobi|iphone|ipod|windows phone/i;
++const ANDROID = /android/i;
++const DESKTOP = /windows nt|macintosh|x11|linux|cros/i;
++
++/**
++ * Reduces a User-Agent header to a coarse device class.
++ *
++ * The class is the only thing derived from the header that is kept. The header itself is never
++ * stored or logged, because combined with other request data it can identify a person.
++ *
++ * This is a heuristic: a client that sends a browser's User-Agent is classified as that browser,
++ * so `bot` means "identified itself as automated", not "every automated client".
++ */
++export function classifyDevice(userAgent: string | undefined): DeviceClass {
++  if (!userAgent) return 'unknown';
++  const ua = userAgent.slice(0, MAX_INSPECTED_LENGTH);
++
++  if (BOT.test(ua)) return 'bot';
++  if (TABLET.test(ua)) return 'tablet';
++  if (MOBILE.test(ua)) return 'mobile';
++  // Android without "Mobile" is how Android tablets identify themselves.
++  if (ANDROID.test(ua)) return 'tablet';
++  if (DESKTOP.test(ua)) return 'desktop';
++  return 'unknown';
++}
+
+===================================================================
+--- a/src/analytics/statsService.ts
++++ b/src/analytics/statsService.ts
+@@ -1,11 +1,18 @@
+ import type { StatementSync } from 'node:sqlite';
+ import type { Database } from '../db/database.ts';
+ import type { ClickRecorder } from './clickRecorder.ts';
++import { DEVICE_CLASSES, type DeviceClass } from './deviceClass.ts';
+ 
+ export interface LinkStats {
+   code: string;
+   totalClicks: number;
++  /** Clicks from clients that identified themselves as automated. */
++  botClicks: number;
++  /** totalClicks minus botClicks. Includes clicks whose device could not be determined. */
++  nonBotClicks: number;
++  /** Every device class, in a fixed order, including classes with no clicks. */
++  clicksByDevice: { device: DeviceClass; clicks: number }[];
+   /** One entry per UTC day that had clicks, within the reporting window, oldest first. */
+   clicksByDay: { date: string; clicks: number }[];
+   /** Most common referring hosts. Clicks without a referrer are reported as "direct". */
+   topReferrers: { referrer: string; clicks: number }[];
+@@ -19,8 +26,9 @@
+   private readonly now: () => Date;
+   private readonly totalStatement: StatementSync;
+   private readonly byDayStatement: StatementSync;
+   private readonly referrersStatement: StatementSync;
++  private readonly devicesStatement: StatementSync;
+ 
+   constructor(db: Database, recorder: ClickRecorder, now: () => Date) {
+     this.recorder = recorder;
+     this.now = now;
+@@ -31,8 +39,14 @@
+       WHERE code = ? AND clicked_at >= ?
+       GROUP BY date
+       ORDER BY date
+     `);
++    this.devicesStatement = db.prepare(`
++      SELECT device_class AS device, COUNT(*) AS clicks
++      FROM click_events
++      WHERE code = ?
++      GROUP BY device_class
++    `);
+     this.referrersStatement = db.prepare(`
+       SELECT COALESCE(referrer_host, 'direct') AS referrer, COUNT(*) AS clicks
+       FROM click_events
+       WHERE code = ?
+@@ -59,11 +73,18 @@
+       referrer: string;
+       clicks: number;
+     }[];
+ 
++    const deviceRows = this.devicesStatement.all(code) as { device: DeviceClass; clicks: number }[];
++    const perDevice = new Map(deviceRows.map((row) => [row.device, row.clicks]));
++    const botClicks = perDevice.get('bot') ?? 0;
++
+     return {
+       code,
+       totalClicks: total.click_count,
++      botClicks,
++      nonBotClicks: total.click_count - botClicks,
++      clicksByDevice: DEVICE_CLASSES.map((device) => ({ device, clicks: perDevice.get(device) ?? 0 })),
+       clicksByDay: clicksByDay.map((row) => ({ date: row.date, clicks: row.clicks })),
+       topReferrers: topReferrers.map((row) => ({ referrer: row.referrer, clicks: row.clicks })),
+     };
+   }
+
+===================================================================
+--- a/src/app.ts
++++ b/src/app.ts
+@@ -39,8 +39,9 @@
+   });
+ 
+   const links = new LinkService(new LinkRepository(db), {
+     publicBaseUrl: config.publicBaseUrl,
++    deniedHosts: config.deniedHosts,
+     now,
+     ...(options.generateCode ? { generateCode: options.generateCode } : {}),
+   });
+   const recorder = new ClickRecorder(db, {
+
+===================================================================
+--- a/src/config.ts
++++ b/src/config.ts
+@@ -1,5 +1,6 @@
+ import { z } from 'zod';
++import { parseDeniedHosts } from './domain/hostRules.ts';
+ 
+ /**
+  * All runtime configuration comes from environment variables and is validated once at startup,
+  * so a bad value fails the process immediately instead of surfacing as a runtime error later.
+@@ -9,8 +10,10 @@
+   PORT: z.coerce.number().int().min(0).max(65535).default(3000),
+   /** Base URL used to build the short links returned to clients. */
+   PUBLIC_BASE_URL: z.url().default('http://localhost:3000'),
+   DATABASE_PATH: z.string().min(1).default('./data/shortener.db'),
++  /** Comma-separated hosts that links may not point to. Subdomains of each host are denied too. */
++  DENIED_HOSTS: z.string().default(''),
+   /** Set only when running behind a trusted reverse proxy, so the client IP comes from X-Forwarded-For. */
+   TRUST_PROXY: z.enum(['true', 'false']).default('false'),
+   /** Token bucket for the management API: burst size and sustained rate per client. */
+   RATE_LIMIT_CAPACITY: z.coerce.number().int().positive().default(20),
+@@ -25,8 +28,9 @@
+   host: string;
+   port: number;
+   publicBaseUrl: string;
+   databasePath: string;
++  deniedHosts: string[];
+   trustProxy: boolean;
+   rateLimit: { capacity: number; refillPerSecond: number };
+   clicks: { flushIntervalMs: number; queueMax: number };
+   logLevel: string;
+@@ -38,13 +42,20 @@
+     const problems = parsed.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`).join('; ');
+     throw new Error(`Invalid configuration: ${problems}`);
+   }
+   const e = parsed.data;
++  let deniedHosts: string[];
++  try {
++    deniedHosts = parseDeniedHosts(e.DENIED_HOSTS);
++  } catch (error) {
++    throw new Error(`Invalid configuration: ${(error as Error).message}`);
++  }
+   return {
+     host: e.HOST,
+     port: e.PORT,
+     publicBaseUrl: e.PUBLIC_BASE_URL.replace(/\/+$/, ''),
+     databasePath: e.DATABASE_PATH,
++    deniedHosts,
+     trustProxy: e.TRUST_PROXY === 'true',
+     rateLimit: { capacity: e.RATE_LIMIT_CAPACITY, refillPerSecond: e.RATE_LIMIT_REFILL_PER_SECOND },
+     clicks: { flushIntervalMs: e.CLICK_FLUSH_INTERVAL_MS, queueMax: e.CLICK_QUEUE_MAX },
+     logLevel: e.LOG_LEVEL,
+
+===================================================================
+--- a/src/domain/errors.ts
++++ b/src/domain/errors.ts
+@@ -24,8 +24,11 @@
+ 
+ export const linkExpired = (code: string): AppError =>
+   new AppError(410, 'link_expired', `The link "${code}" has expired.`);
+ 
++export const linkBlocked = (code: string): AppError =>
++  new AppError(410, 'link_blocked', `The link "${code}" is no longer available.`);
++
+ export const aliasTaken = (alias: string): AppError =>
+   new AppError(409, 'alias_taken', `The alias "${alias}" is already in use.`);
+ 
+ export const rateLimited = (retryAfterSeconds: number): AppError =>
+
+===================================================================
+--- /dev/null
++++ b/src/domain/hostRules.ts
+@@ -0,0 +1,66 @@
++import { BlockList, isIP } from 'node:net';
++
++/**
++ * Address ranges that are never a public destination: loopback, private networks, link-local
++ * (which includes cloud metadata endpoints), carrier-grade NAT, and the unspecified address.
++ */
++const NON_PUBLIC_RANGES = new BlockList();
++NON_PUBLIC_RANGES.addSubnet('0.0.0.0', 8, 'ipv4');
++NON_PUBLIC_RANGES.addSubnet('10.0.0.0', 8, 'ipv4');
++NON_PUBLIC_RANGES.addSubnet('100.64.0.0', 10, 'ipv4');
++NON_PUBLIC_RANGES.addSubnet('127.0.0.0', 8, 'ipv4');
++NON_PUBLIC_RANGES.addSubnet('169.254.0.0', 16, 'ipv4');
++NON_PUBLIC_RANGES.addSubnet('172.16.0.0', 12, 'ipv4');
++NON_PUBLIC_RANGES.addSubnet('192.168.0.0', 16, 'ipv4');
++NON_PUBLIC_RANGES.addAddress('::', 'ipv6');
++NON_PUBLIC_RANGES.addAddress('::1', 'ipv6');
++NON_PUBLIC_RANGES.addSubnet('fc00::', 7, 'ipv6');
++NON_PUBLIC_RANGES.addSubnet('fe80::', 10, 'ipv6');
++
++/** Name suffixes reserved for local or internal use. */
++const INTERNAL_SUFFIXES = ['.localhost', '.local', '.internal', '.lan', '.home.arpa'];
++
++/** Lowercases a URL hostname and strips IPv6 brackets and a trailing dot, so rules compare like with like. */
++export function canonicalHost(hostname: string): string {
++  return hostname.toLowerCase().replace(/^\[|\]$/g, '').replace(/\.$/, '');
++}
++
++/**
++ * True when the host is an internal address or name.
++ *
++ * `hostname` must come from a parsed `URL`, which has already turned forms such as `2130706433`,
++ * `0x7f.1` and `127.1` into `127.0.0.1`. Names are judged by their text only: this does not
++ * resolve DNS, so a public name that points at a private address is not detected here.
++ */
++export function isInternalHost(hostname: string): boolean {
++  const host = canonicalHost(hostname);
++  const family = isIP(host);
++  if (family === 4) return NON_PUBLIC_RANGES.check(host, 'ipv4');
++  // BlockList also matches IPv4-mapped IPv6 addresses (::ffff:10.0.0.1) against the IPv4 ranges.
++  if (family === 6) return NON_PUBLIC_RANGES.check(host, 'ipv6');
++
++  if (host === 'localhost') return true;
++  // A name without a dot can only resolve inside someone's network.
++  if (!host.includes('.')) return true;
++  return INTERNAL_SUFFIXES.some((suffix) => host.endsWith(suffix));
++}
++
++/** True when the host is a denied host or any subdomain of one. */
++export function isDeniedHost(hostname: string, deniedHosts: readonly string[]): boolean {
++  const host = canonicalHost(hostname);
++  return deniedHosts.some((denied) => host === denied || host.endsWith(`.${denied}`));
++}
++
++/** Parses the DENIED_HOSTS setting: comma-separated host names. Throws on anything that is not a host name. */
++export function parseDeniedHosts(value: string): string[] {
++  const hosts = value
++    .split(',')
++    .map((entry) => canonicalHost(entry.trim()))
++    .filter((entry) => entry !== '');
++  for (const host of hosts) {
++    if (!/^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/.test(host)) {
++      throw new Error(`DENIED_HOSTS contains an invalid host name: "${host}"`);
++    }
++  }
++  return [...new Set(hosts)];
++}
+
+===================================================================
+--- a/src/domain/urlPolicy.ts
++++ b/src/domain/urlPolicy.ts
+@@ -1,11 +1,14 @@
+ import { validationError } from './errors.ts';
++import { isDeniedHost, isInternalHost } from './hostRules.ts';
+ 
+ export const MAX_URL_LENGTH = 2048;
+ 
+ export interface UrlPolicyOptions {
+   /** Host of this service. Links pointing back at it are rejected to prevent redirect loops. */
+   selfHost: string;
++  /** Hosts, and their subdomains, that links may not point to. */
++  deniedHosts: readonly string[];
+ }
+ 
+ /**
+  * Validates a destination URL and returns its normalized form.
+@@ -33,7 +36,24 @@
+   }
+   if (url.host.toLowerCase() === options.selfHost.toLowerCase()) {
+     throw validationError('url must not point at this service.');
+   }
++  if (!isAllowedDestination(url, options.deniedHosts)) {
++    throw validationError('url points to a destination that is not allowed.');
++  }
+ 
+   return url.toString();
+ }
++
++/**
++ * The safety rules that can change after a link was created: the denylist is configuration, so a
++ * stored link is checked again with this at redirect time.
++ */
++export function isAllowedDestination(target: URL | string, deniedHosts: readonly string[]): boolean {
++  let url: URL;
++  try {
++    url = typeof target === 'string' ? new URL(target) : target;
++  } catch {
++    return false;
++  }
++  return !isInternalHost(url.hostname) && !isDeniedHost(url.hostname, deniedHosts);
++}
+
+===================================================================
+--- a/src/http/routes.ts
++++ b/src/http/routes.ts
+@@ -1,7 +1,8 @@
+ import type { FastifyInstance } from 'fastify';
+ import { z } from 'zod';
+ import { referrerHost, type ClickRecorder } from '../analytics/clickRecorder.ts';
++import { classifyDevice } from '../analytics/deviceClass.ts';
+ import type { StatsService } from '../analytics/statsService.ts';
+ import type { Database } from '../db/database.ts';
+ import { linkNotFound, validationError } from '../domain/errors.ts';
+ import { CODE_PATTERN } from '../domain/shortCode.ts';
+@@ -67,8 +68,10 @@
+     recorder.record({
+       code,
+       clickedAt: now().toISOString(),
+       referrerHost: referrerHost(request.headers.referer),
++      // The header is reduced to a class here and goes no further.
++      deviceClass: classifyDevice(request.headers['user-agent']),
+     });
+     // 302 with no-store: browsers must ask every time, so each click is counted and a link can change later.
+     return reply
+       .code(302)
+
+===================================================================
+--- a/src/links/linkService.ts
++++ b/src/links/linkService.ts
+@@ -1,13 +1,14 @@
+ import {
+   aliasTaken,
+   codeSpaceExhausted,
++  linkBlocked,
+   linkExpired,
+   linkNotFound,
+   validationError,
+ } from '../domain/errors.ts';
+ import { generateCode, validateAlias } from '../domain/shortCode.ts';
+-import { normalizeTargetUrl } from '../domain/urlPolicy.ts';
++import { isAllowedDestination, normalizeTargetUrl } from '../domain/urlPolicy.ts';
+ import type { LinkRecord, LinkRepository, NewLink } from './linkRepository.ts';
+ 
+ /** Longest lifetime a caller may ask for with `ttlSeconds`: five years. */
+ export const MAX_TTL_SECONDS = 5 * 365 * 24 * 60 * 60;
+@@ -30,8 +31,10 @@
+ }
+ 
+ export interface LinkServiceOptions {
+   publicBaseUrl: string;
++  /** Hosts, and their subdomains, that links may not point to. */
++  deniedHosts: readonly string[];
+   now: () => Date;
+   generateCode?: () => string;
+   /** How many random codes to try before giving up. A clash is rare, so repeated clashes signal a real problem. */
+   maxCodeAttempts?: number;
+@@ -40,24 +43,29 @@
+ export class LinkService {
+   private readonly repository: LinkRepository;
+   private readonly publicBaseUrl: string;
+   private readonly selfHost: string;
++  private readonly deniedHosts: readonly string[];
+   private readonly now: () => Date;
+   private readonly generate: () => string;
+   private readonly maxCodeAttempts: number;
+ 
+   constructor(repository: LinkRepository, options: LinkServiceOptions) {
+     this.repository = repository;
+     this.publicBaseUrl = options.publicBaseUrl;
+     this.selfHost = new URL(options.publicBaseUrl).host;
++    this.deniedHosts = options.deniedHosts;
+     this.now = options.now;
+     this.generate = options.generateCode ?? (() => generateCode());
+     this.maxCodeAttempts = options.maxCodeAttempts ?? 5;
+   }
+ 
+   create(input: CreateLinkInput): Link {
+     const now = this.now();
+-    const targetUrl = normalizeTargetUrl(input.url, { selfHost: this.selfHost });
++    const targetUrl = normalizeTargetUrl(input.url, {
++      selfHost: this.selfHost,
++      deniedHosts: this.deniedHosts,
++    });
+     const expiresAt = resolveExpiry(input, now);
+     const createdAt = now.toISOString();
+ 
+     if (input.alias !== undefined) {
+@@ -82,12 +90,18 @@
+     if (!record) throw linkNotFound(code);
+     return record;
+   }
+ 
+-  /** Returns a link that may be redirected to: throws 404 if unknown and 410 if expired. */
++  /**
++   * Returns a link that may be redirected to: throws 404 if unknown, and 410 if it has expired or
++   * its destination is no longer allowed.
++   */
+   resolve(code: string): LinkRecord {
+     const record = this.get(code);
+     if (isExpired(record, this.now())) throw linkExpired(code);
++    // Checked on every redirect, not only at creation: adding a host to the denylist must also
++    // stop links that already point there.
++    if (!isAllowedDestination(record.targetUrl, this.deniedHosts)) throw linkBlocked(code);
+     return record;
+   }
+ 
+   toLink(link: NewLink): Link {
+
+===================================================================
+--- /dev/null
++++ b/test/integration/safety.api.test.ts
+@@ -0,0 +1,86 @@
++import { afterEach, describe, expect, it } from 'vitest';
++import { openDatabase } from '../../src/db/database.ts';
++import { createLink, createTestApp, type TestApp } from '../helpers.ts';
++
++describe('destination safety', () => {
++  let t: TestApp;
++  afterEach(async () => {
++    await t.app.close();
++  });
++
++  describe('when creating a link', () => {
++    it.each([
++      ['a denied host', 'https://malware.example/payload'],
++      ['a subdomain of a denied host', 'https://files.malware.example/payload'],
++      ['a denied host in another letter case', 'https://MALWARE.example/'],
++      ['a private network address', 'http://192.168.1.1/admin'],
++      ['the cloud metadata address', 'http://169.254.169.254/latest/meta-data/'],
++      ['a loopback address written as an integer', 'http://2130706433/'],
++      ['an IPv6 loopback address', 'http://[::1]:8080/'],
++      ['localhost', 'http://localhost:9200/_cat/indices'],
++      ['an internal host name', 'http://jenkins.corp.internal/'],
++      ['a single-label host name', 'http://intranet/wiki'],
++    ])('rejects %s with 400', async (_label, url) => {
++      t = createTestApp({ env: { DENIED_HOSTS: 'malware.example' } });
++      const { status, body } = await createLink(t.app, { url });
++      expect(status).toBe(400);
++      expect(body).toMatchObject({ code: 'validation_error', detail: 'url points to a destination that is not allowed.' });
++    });
++
++    it('accepts public destinations that are not denied', async () => {
++      t = createTestApp({ env: { DENIED_HOSTS: 'malware.example' } });
++      expect((await createLink(t.app, { url: 'https://example.com/page' })).status).toBe(201);
++      expect((await createLink(t.app, { url: 'https://notmalware.example/' })).status).toBe(201);
++      expect((await createLink(t.app, { url: 'http://93.184.216.34/' })).status).toBe(201);
++    });
++  });
++
++  describe('when redirecting', () => {
++    it('blocks an existing link once its host is added to the denylist', async () => {
++      // The same database, first without and then with the host on the denylist, as after a config change.
++      const db = openDatabase(':memory:');
++      const before = createTestApp({ db });
++      await createLink(before.app, { url: 'https://later-bad.example/landing', alias: 'old-link' });
++      expect((await before.app.inject({ method: 'GET', url: '/old-link' })).statusCode).toBe(302);
++      await before.app.close();
++
++      t = createTestApp({ db, env: { DENIED_HOSTS: 'later-bad.example' } });
++      const response = await t.app.inject({ method: 'GET', url: '/old-link' });
++      expect(response.statusCode).toBe(410);
++      expect(response.headers.location).toBeUndefined();
++      expect(response.json()).toMatchObject({ status: 410, code: 'link_blocked' });
++    });
++
++    it('does not record a click or reveal the destination for a blocked link', async () => {
++      const db = openDatabase(':memory:');
++      const before = createTestApp({ db });
++      await createLink(before.app, { url: 'https://later-bad.example/landing', alias: 'old-link' });
++      await before.app.close();
++
++      t = createTestApp({ db, env: { DENIED_HOSTS: 'later-bad.example' } });
++      const response = await t.app.inject({ method: 'GET', url: '/old-link' });
++      expect(response.body).not.toContain('later-bad.example');
++      const stats = (await t.app.inject({ method: 'GET', url: '/api/v1/links/old-link/stats' })).json();
++      expect(stats.totalClicks).toBe(0);
++    });
++
++    it('blocks a stored link that points at an internal address', async () => {
++      t = createTestApp();
++      t.db
++        .prepare("INSERT INTO links (code, target_url, created_at) VALUES ('legacy-int', 'http://10.0.0.5/admin', '2025-01-01T00:00:00.000Z')")
++        .run();
++      const response = await t.app.inject({ method: 'GET', url: '/legacy-int' });
++      expect(response.statusCode).toBe(410);
++      expect(response.json().code).toBe('link_blocked');
++    });
++  });
++
++  describe('configuration', () => {
++    it('refuses to start with a malformed denylist', () => {
++      expect(() => createTestApp({ env: { DENIED_HOSTS: 'https://malware.example' } })).toThrowError(
++        /Invalid configuration: DENIED_HOSTS/,
++      );
++      t = createTestApp();
++    });
++  });
++});
+
+===================================================================
+--- a/test/integration/stats.api.test.ts
++++ b/test/integration/stats.api.test.ts
+@@ -12,14 +12,32 @@
+   afterEach(async () => {
+     await t.app.close();
+   });
+ 
+-  const click = (referer?: string) =>
+-    t.app.inject({ method: 'GET', url: '/campaign', headers: referer ? { referer } : {} });
++  const click = (referer?: string, userAgent?: string) =>
++    t.app.inject({
++      method: 'GET',
++      url: '/campaign',
++      headers: { ...(referer ? { referer } : {}), ...(userAgent ? { 'user-agent': userAgent } : {}) },
++    });
+   const stats = async () => (await t.app.inject({ method: 'GET', url: '/api/v1/links/campaign/stats' })).json();
+ 
+   it('reports zero clicks for a new link', async () => {
+-    expect(await stats()).toEqual({ code: 'campaign', totalClicks: 0, clicksByDay: [], topReferrers: [] });
++    expect(await stats()).toEqual({
++      code: 'campaign',
++      totalClicks: 0,
++      botClicks: 0,
++      nonBotClicks: 0,
++      clicksByDevice: [
++        { device: 'desktop', clicks: 0 },
++        { device: 'mobile', clicks: 0 },
++        { device: 'tablet', clicks: 0 },
++        { device: 'bot', clicks: 0 },
++        { device: 'unknown', clicks: 0 },
++      ],
++      clicksByDay: [],
++      topReferrers: [],
++    });
+   });
+ 
+   it('counts every redirect', async () => {
+     await click();
+@@ -66,8 +84,60 @@
+     const rows = t.db.prepare('SELECT referrer_host FROM click_events').all();
+     expect(rows).toEqual([{ referrer_host: 'news.example' }]);
+   });
+ 
++  describe('device breakdown', () => {
++    const IPHONE = 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 Mobile/15E148 Safari/604.1';
++    const WINDOWS = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/140.0 Safari/537.36';
++    const GOOGLEBOT = 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)';
++
++    it('counts clicks per device class', async () => {
++      await click(undefined, IPHONE);
++      await click(undefined, IPHONE);
++      await click(undefined, WINDOWS);
++      await click(undefined, GOOGLEBOT);
++      await click(undefined, 'something-unrecognised');
++      expect((await stats()).clicksByDevice).toEqual([
++        { device: 'desktop', clicks: 1 },
++        { device: 'mobile', clicks: 2 },
++        { device: 'tablet', clicks: 0 },
++        { device: 'bot', clicks: 1 },
++        { device: 'unknown', clicks: 1 },
++      ]);
++    });
++
++    it('reports bot clicks separately and keeps totalClicks as the sum of both', async () => {
++      await click(undefined, WINDOWS);
++      await click(undefined, GOOGLEBOT);
++      await click(undefined, GOOGLEBOT);
++      const result = await stats();
++      expect(result.totalClicks).toBe(3);
++      expect(result.botClicks).toBe(2);
++      expect(result.nonBotClicks).toBe(1);
++    });
++
++    it('stores the device class but never the User-Agent header', async () => {
++      await click('https://news.example/a', IPHONE);
++      await stats();
++      const rows = t.db.prepare('SELECT * FROM click_events').all() as Record<string, unknown>[];
++      expect(Object.keys(rows[0]!).sort()).toEqual(['clicked_at', 'code', 'device_class', 'id', 'referrer_host']);
++      expect(JSON.stringify(rows)).not.toContain('iPhone');
++    });
++
++    it('reports clicks recorded before the device column existed as unknown', async () => {
++      t.db
++        .prepare("INSERT INTO click_events (code, clicked_at, referrer_host) VALUES ('campaign', '2026-03-01T11:00:00.000Z', NULL)")
++        .run();
++      t.db.prepare("UPDATE links SET click_count = 1 WHERE code = 'campaign'").run();
++      const result = await stats();
++      expect(result.clicksByDevice.find((d: { device: string }) => d.device === 'unknown')).toEqual({
++        device: 'unknown',
++        clicks: 1,
++      });
++      expect(result.nonBotClicks).toBe(1);
++    });
++  });
++
+   it('does not count failed lookups', async () => {
+     await t.app.inject({ method: 'GET', url: '/missing1' });
+     expect((await stats()).totalClicks).toBe(0);
+   });
+
+===================================================================
+--- a/test/unit/clickRecorder.test.ts
++++ b/test/unit/clickRecorder.test.ts
+@@ -9,9 +9,14 @@
+   migrate(db, MIGRATIONS_DIR);
+   db.prepare("INSERT INTO links (code, target_url, created_at) VALUES ('abc1234', 'https://example.com/', '2026-03-01T00:00:00.000Z')").run();
+   const recorder = new ClickRecorder(db, { flushIntervalMs: 60_000, maxQueue });
+   const click = (referrer: string | null = null) =>
+-    recorder.record({ code: 'abc1234', clickedAt: '2026-03-01T12:00:00.000Z', referrerHost: referrer });
++    recorder.record({
++      code: 'abc1234',
++      clickedAt: '2026-03-01T12:00:00.000Z',
++      referrerHost: referrer,
++      deviceClass: 'desktop',
++    });
+   const count = () =>
+     (db.prepare("SELECT click_count FROM links WHERE code = 'abc1234'").get() as { click_count: number }).click_count;
+   const events = () => (db.prepare('SELECT COUNT(*) AS n FROM click_events').get() as { n: number }).n;
+   return { db, recorder, click, count, events };
+@@ -37,8 +42,15 @@
+     expect(count()).toBe(3);
+     expect(events()).toBe(3);
+   });
+ 
++  it('stores the device class with each event', () => {
++    const { db, recorder } = setup();
++    recorder.record({ code: 'abc1234', clickedAt: '2026-03-01T12:00:00.000Z', referrerHost: null, deviceClass: 'mobile' });
++    recorder.flush();
++    expect(db.prepare('SELECT device_class FROM click_events').all()).toEqual([{ device_class: 'mobile' }]);
++  });
++
+   it('drops clicks beyond the queue bound and counts them', () => {
+     const { recorder, click, count } = setup(2);
+     click();
+     click();
+@@ -61,9 +73,14 @@
+   it('keeps the batch and leaves the database untouched when a flush fails', () => {
+     const { recorder, click, count, events } = setup();
+     click();
+     // A click for a code with no link violates the foreign key, so the whole batch must roll back.
+-    recorder.record({ code: 'missing', clickedAt: '2026-03-01T12:00:00.000Z', referrerHost: null });
++    recorder.record({
++      code: 'missing',
++      clickedAt: '2026-03-01T12:00:00.000Z',
++      referrerHost: null,
++      deviceClass: 'unknown',
++    });
+     expect(() => recorder.flush()).toThrowError();
+     expect(recorder.pending).toBe(2);
+     expect(count()).toBe(0);
+     expect(events()).toBe(0);
+
+===================================================================
+--- /dev/null
++++ b/test/unit/deviceClass.test.ts
+@@ -0,0 +1,39 @@
++import { describe, expect, it } from 'vitest';
++import { classifyDevice } from '../../src/analytics/deviceClass.ts';
++
++describe('classifyDevice', () => {
++  it.each([
++    ['Windows Chrome', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36', 'desktop'],
++    ['macOS Safari', 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15', 'desktop'],
++    ['Linux Firefox', 'Mozilla/5.0 (X11; Linux x86_64; rv:130.0) Gecko/20100101 Firefox/130.0', 'desktop'],
++    ['iPhone', 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1', 'mobile'],
++    ['Android phone', 'Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Mobile Safari/537.36', 'mobile'],
++    ['iPad', 'Mozilla/5.0 (iPad; CPU OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1', 'tablet'],
++    ['Android tablet', 'Mozilla/5.0 (Linux; Android 14; SM-X710) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36', 'tablet'],
++    ['Googlebot', 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)', 'bot'],
++    ['Googlebot smartphone', 'Mozilla/5.0 (Linux; Android 6.0.1; Nexus 5X Build/MMB29P) AppleWebKit/537.36 Chrome/140.0.0.0 Mobile Safari/537.36 (compatible; Googlebot/2.1)', 'bot'],
++    ['link preview fetcher', 'Slackbot-LinkExpanding 1.0 (+https://api.slack.com/robots)', 'bot'],
++    ['curl', 'curl/8.7.1', 'bot'],
++    ['headless browser', 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 HeadlessChrome/140.0.0.0 Safari/537.36', 'bot'],
++    ['HTTP library', 'python-requests/2.32.3', 'bot'],
++    ['unrecognised client', 'SomethingElse/1.0', 'unknown'],
++    ['empty header', '', 'unknown'],
++  ])('classifies %s', (_label, userAgent, expected) => {
++    expect(classifyDevice(userAgent)).toBe(expected);
++  });
++
++  it('classifies a missing header as unknown', () => {
++    expect(classifyDevice(undefined)).toBe('unknown');
++  });
++
++  it('inspects only the start of an oversized header', () => {
++    const padded = `${'x'.repeat(600)} Googlebot/2.1`;
++    expect(classifyDevice(padded)).toBe('unknown');
++  });
++
++  it('handles a very large header quickly', () => {
++    const started = performance.now();
++    classifyDevice('Mozilla/5.0 '.repeat(100_000));
++    expect(performance.now() - started).toBeLessThan(50);
++  });
++});
+
+===================================================================
+--- /dev/null
++++ b/test/unit/hostRules.test.ts
+@@ -0,0 +1,83 @@
++import { describe, expect, it } from 'vitest';
++import { isDeniedHost, isInternalHost, parseDeniedHosts } from '../../src/domain/hostRules.ts';
++
++/** Host as the service sees it: taken from a parsed URL, which canonicalizes unusual address forms. */
++const hostOf = (url: string) => new URL(url).hostname;
++
++describe('isInternalHost', () => {
++  it.each([
++    ['loopback', 'http://127.0.0.1/'],
++    ['loopback range', 'http://127.8.8.8/'],
++    ['private 10/8', 'http://10.1.2.3/'],
++    ['private 172.16/12', 'http://172.31.255.255/'],
++    ['private 192.168/16', 'http://192.168.0.10/'],
++    ['link-local / cloud metadata', 'http://169.254.169.254/latest/meta-data/'],
++    ['carrier-grade NAT', 'http://100.64.0.1/'],
++    ['unspecified address', 'http://0.0.0.0/'],
++    ['decimal integer form', 'http://2130706433/'],
++    ['hex form', 'http://0x7f.0.0.1/'],
++    ['short form', 'http://127.1/'],
++    ['IPv6 loopback', 'http://[::1]/'],
++    ['IPv6 unique local', 'http://[fd12:3456:789a::1]/'],
++    ['IPv6 link-local', 'http://[fe80::1]/'],
++    ['IPv4-mapped IPv6', 'http://[::ffff:10.0.0.1]/'],
++    ['localhost', 'http://localhost:3000/'],
++    ['localhost with trailing dot', 'http://localhost./'],
++    ['localhost subdomain', 'http://app.localhost/'],
++    ['mDNS name', 'http://printer.local/'],
++    ['internal suffix', 'http://vault.corp.internal/'],
++    ['single-label name', 'http://intranet/'],
++  ])('treats %s as internal', (_label, url) => {
++    expect(isInternalHost(hostOf(url))).toBe(true);
++  });
++
++  it.each([
++    ['a public name', 'https://example.com/'],
++    ['a public name with trailing dot', 'https://example.com./'],
++    ['a public IPv4 address', 'http://93.184.216.34/'],
++    ['just outside 172.16/12', 'http://172.32.0.1/'],
++    ['a public IPv6 address', 'http://[2606:2800:220:1:248:1893:25c8:1946]/'],
++    ['a name that merely contains "local"', 'https://localnews.example/'],
++  ])('treats %s as public', (_label, url) => {
++    expect(isInternalHost(hostOf(url))).toBe(false);
++  });
++});
++
++describe('isDeniedHost', () => {
++  const denied = ['malware.example', 'phish.test'];
++
++  it('matches a denied host and its subdomains, in any case', () => {
++    expect(isDeniedHost('malware.example', denied)).toBe(true);
++    expect(isDeniedHost('cdn.malware.example', denied)).toBe(true);
++    expect(isDeniedHost('MALWARE.EXAMPLE', denied)).toBe(true);
++    expect(isDeniedHost('malware.example.', denied)).toBe(true);
++  });
++
++  it('does not match hosts that only share a suffix of characters', () => {
++    expect(isDeniedHost('notmalware.example', denied)).toBe(false);
++    expect(isDeniedHost('malware.example.org', denied)).toBe(false);
++    expect(isDeniedHost('example', denied)).toBe(false);
++  });
++
++  it('denies nothing when the list is empty', () => {
++    expect(isDeniedHost('malware.example', [])).toBe(false);
++  });
++});
++
++describe('parseDeniedHosts', () => {
++  it('parses, trims, lowercases and de-duplicates', () => {
++    expect(parseDeniedHosts(' Malware.Example , phish.test,malware.example ')).toEqual(['malware.example', 'phish.test']);
++  });
++
++  it('returns an empty list for an empty setting', () => {
++    expect(parseDeniedHosts('')).toEqual([]);
++    expect(parseDeniedHosts(' , ')).toEqual([]);
++  });
++
++  it.each(['https://malware.example', 'malware.example/path', '*.example', 'com', 'bad host.example'])(
++    'rejects "%s" because it is not a host name',
++    (value) => {
++      expect(() => parseDeniedHosts(value)).toThrowError(/invalid host name/);
++    },
++  );
++});
+
+===================================================================
+--- a/test/unit/urlPolicy.test.ts
++++ b/test/unit/urlPolicy.test.ts
+@@ -1,8 +1,8 @@
+ import { describe, expect, it } from 'vitest';
+ import { MAX_URL_LENGTH, normalizeTargetUrl } from '../../src/domain/urlPolicy.ts';
+ 
+-const options = { selfHost: 'sho.rt' };
++const options = { selfHost: 'sho.rt', deniedHosts: ['malware.example'] };
+ 
+ describe('normalizeTargetUrl', () => {
+   it('accepts http and https URLs and normalizes them', () => {
+     expect(normalizeTargetUrl('https://Example.com/a?b=1#c', options)).toBe('https://example.com/a?b=1#c');
+@@ -31,8 +31,15 @@
+     expect(() => normalizeTargetUrl('https://sho.rt/abc1234', options)).toThrowError(/this service/);
+     expect(() => normalizeTargetUrl('https://SHO.RT/abc1234', options)).toThrowError(/this service/);
+   });
+ 
++  it('rejects denied hosts and internal destinations', () => {
++    expect(() => normalizeTargetUrl('https://malware.example/download', options)).toThrowError(/not allowed/);
++    expect(() => normalizeTargetUrl('https://cdn.malware.example/x', options)).toThrowError(/not allowed/);
++    expect(() => normalizeTargetUrl('http://192.168.1.1/admin', options)).toThrowError(/not allowed/);
++    expect(() => normalizeTargetUrl('http://localhost:8080/', options)).toThrowError(/not allowed/);
++  });
++
+   it('cannot be used to smuggle a header line into the Location header', () => {
+     const normalized = normalizeTargetUrl('https://example.com/a\r\nSet-Cookie: x=1', options);
+     expect(normalized).not.toMatch(/[\r\n]/);
+   });

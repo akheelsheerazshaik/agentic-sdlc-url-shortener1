@@ -1,0 +1,721 @@
+
+====================================================================================================
+SCENARIO 1: GREENFIELD. Build the URL shortener from a well-defined requirement, starting from nothing.
+====================================================================================================
+
+$ sdlc run --scenario scenarios/01-greenfield --target demo-output/url-shortener --run-id greenfield
+Run greenfield: "URL shortener service" (offline mode) → demo-output/url-shortener
+  ▶ requirements: started (generation 1, attempt 1)
+  ✔ requirements: succeeded
+  – impact-analysis: skipped (not enabled for this run)
+  ▶ planning: started (generation 1, attempt 1)
+  ✔ planning: succeeded
+  ▶ architecture: started (generation 1, attempt 1)
+  ⏸ architecture: waiting for approval: The design changes the database schema. | The design changes the public API (additive). | The design adds or changes dependencies: fastify, zod, typescript, vitest, @types/node.
+
+Run greenfield: PAUSED
+  SUCCEEDED          requirements
+  SKIPPED            impact-analysis
+  SUCCEEDED          planning
+  AWAITING_APPROVAL  architecture
+  PENDING            implementation
+  PENDING            test-design
+  PENDING            documentation
+  PENDING            integrate
+  PENDING            build-verify
+  PENDING            policy-review
+  PENDING            release-readiness
+  PENDING            promote
+
+  architecture is waiting for approval:
+    - The design changes the database schema.
+    - The design changes the public API (additive).
+    - The design adds or changes dependencies: fastify, zod, typescript, vitest, @types/node.
+
+  Review packet: demo-output/runs/greenfield/review/README.md
+
+# The design adds a schema, an API and dependencies, so it needs a person. The run has exited and is waiting.
+
+$ sdlc approve greenfield architecture --by demo-reviewer --comment 'Design, schema and dependency list accepted.'
+Recorded: architecture approved by demo-reviewer. Continue with: resume greenfield
+
+$ sdlc resume greenfield
+  ▶ implementation: started (generation 1, attempt 1)
+  ▶ test-design: started (generation 1, attempt 1)
+  ▶ documentation: started (generation 1, attempt 1)
+  ✔ implementation: succeeded
+  ✔ documentation: succeeded
+  ✔ test-design: succeeded
+  ▶ integrate: started (generation 1, attempt 1)
+  ✔ integrate: succeeded
+  ▶ build-verify: started (generation 1, attempt 1)
+  ▶ policy-review: started (generation 1, attempt 1)
+  ✔ policy-review: succeeded
+  ✔ build-verify: succeeded
+  ▶ release-readiness: started (generation 1, attempt 1)
+  ⏸ release-readiness: waiting for approval: Release sign-off for CHG-greenfield: 32 added, 0 modified, 0 deleted; 88/88 tests pass. | High impact: CHG-001 migrations/001_init.sql: adds a database migration | High impact: CHG-002 package.json: changes dependenc…
+
+Run greenfield: PAUSED
+  SUCCEEDED          requirements
+  SKIPPED            impact-analysis
+  SUCCEEDED          planning
+  SUCCEEDED          architecture
+  SUCCEEDED          implementation
+  SUCCEEDED          test-design
+  SUCCEEDED          documentation
+  SUCCEEDED          integrate
+  SUCCEEDED          build-verify
+  SUCCEEDED          policy-review
+  AWAITING_APPROVAL  release-readiness
+  PENDING            promote
+
+  release-readiness is waiting for approval:
+    - Release sign-off for CHG-greenfield: 32 added, 0 modified, 0 deleted; 88/88 tests pass.
+    - High impact: CHG-001 migrations/001_init.sql: adds a database migration
+    - High impact: CHG-002 package.json: changes dependency "@types/node"
+    - High impact: CHG-002 package.json: changes dependency "fastify"
+    - High impact: CHG-002 package.json: changes dependency "typescript"
+    - High impact: CHG-002 package.json: changes dependency "vitest"
+    - High impact: CHG-002 package.json: changes dependency "zod"
+
+  Review packet: demo-output/runs/greenfield/review/README.md
+
+# Built and verified in the sandbox. Nothing has been written to the target yet. A release always needs sign-off.
+
+$ sdlc approve greenfield release-readiness --by demo-reviewer --comment 'First release approved.'
+Recorded: release-readiness approved by demo-reviewer. Continue with: resume greenfield
+
+$ sdlc resume greenfield
+  ▶ promote: started (generation 1, attempt 1)
+  ✔ promote: succeeded
+
+Run greenfield: SUCCEEDED
+  SUCCEEDED          requirements
+  SKIPPED            impact-analysis
+  SUCCEEDED          planning
+  SUCCEEDED          architecture
+  SUCCEEDED          implementation
+  SUCCEEDED          test-design
+  SUCCEEDED          documentation
+  SUCCEEDED          integrate
+  SUCCEEDED          build-verify
+  SUCCEEDED          policy-review
+  SUCCEEDED          release-readiness
+  SUCCEEDED          promote
+
+  Review packet: demo-output/runs/greenfield/review/README.md
+
+====================================================================================================
+SCENARIO 2: BROWNFIELD. Add link expiry and fix a defect in the existing service.
+====================================================================================================
+
+$ sdlc run --scenario scenarios/02-brownfield --target demo-output/url-shortener --run-id brownfield
+Run brownfield: "Link expiry, and clicks lost on restart" (offline mode) → demo-output/url-shortener
+  ▶ requirements: started (generation 1, attempt 1)
+  ✔ requirements: succeeded
+  ▶ impact-analysis: started (generation 1, attempt 1)
+  ✔ impact-analysis: succeeded
+  ▶ planning: started (generation 1, attempt 1)
+  ✔ planning: succeeded
+  ▶ architecture: started (generation 1, attempt 1)
+  ⏸ architecture: waiting for approval: The design changes the database schema. | The design changes the public API (additive).
+
+Run brownfield: PAUSED
+  SUCCEEDED          requirements
+  SUCCEEDED          impact-analysis
+  SUCCEEDED          planning
+  AWAITING_APPROVAL  architecture
+  PENDING            implementation
+  PENDING            test-design
+  PENDING            documentation
+  PENDING            integrate
+  PENDING            build-verify
+  PENDING            policy-review
+  PENDING            release-readiness
+  PENDING            promote
+
+  architecture is waiting for approval:
+    - The design changes the database schema.
+    - The design changes the public API (additive).
+
+  Review packet: demo-output/runs/brownfield/review/README.md
+
+$ sdlc approve brownfield architecture --by demo-reviewer --comment 'Additive migration and API change accepted.'
+Recorded: architecture approved by demo-reviewer. Continue with: resume brownfield
+
+# Watch the build: the first implementation misses a validation rule, the independently written tests fail,
+
+# and the engine sends the work back with the failure as feedback.
+
+$ sdlc resume brownfield
+  ▶ implementation: started (generation 1, attempt 1)
+  ▶ test-design: started (generation 1, attempt 1)
+  ▶ documentation: started (generation 1, attempt 1)
+  ✔ implementation: succeeded
+  ✔ documentation: succeeded
+  ✔ test-design: succeeded
+  ▶ integrate: started (generation 1, attempt 1)
+  ✔ integrate: succeeded
+  ▶ build-verify: started (generation 1, attempt 1)
+  ▶ policy-review: started (generation 1, attempt 1)
+  ✔ policy-review: succeeded
+  ✘ build-verify: exit gate "build-green" failed: test failed: test/integration/expiry.api.test.ts > link expiry creating a link rejects an expiry in the past with 400: AssertionError: expected 201 to be 400 // Object.is equality | test failed: test/integration…
+  ↺ build-verify: sent work back upstream (loop 1 of 2)
+  ↺ implementation: invalidated, will re-run: inputs changed (build-feedback)
+  ↺ test-design: invalidated, will re-run: inputs changed (build-feedback)
+  ▶ implementation: started (generation 2, attempt 1)
+  ▶ test-design: started (generation 2, attempt 1)
+  ✔ implementation: succeeded
+  ✔ test-design: succeeded
+  ↺ integrate: invalidated, will re-run: inputs changed (code-changes)
+  ▶ integrate: started (generation 2, attempt 1)
+  ✔ integrate: succeeded
+  ↺ policy-review: invalidated, will re-run: inputs changed (workspace-state)
+  ▶ build-verify: started (generation 2, attempt 1)
+  ▶ policy-review: started (generation 2, attempt 1)
+  ✔ policy-review: succeeded
+  ✔ build-verify: succeeded
+  ▶ release-readiness: started (generation 1, attempt 1)
+  ⏸ release-readiness: waiting for approval: Release sign-off for CHG-brownfield: 4 added, 10 modified, 0 deleted; 113/113 tests pass. | High impact: CHG-001 migrations/002_link_expiry.sql: adds a database migration
+
+Run brownfield: PAUSED
+  SUCCEEDED          requirements
+  SUCCEEDED          impact-analysis
+  SUCCEEDED          planning
+  SUCCEEDED          architecture
+  SUCCEEDED          implementation  (generation 2)
+  SUCCEEDED          test-design  (generation 2)
+  SUCCEEDED          documentation
+  SUCCEEDED          integrate  (generation 2)
+  SUCCEEDED          build-verify  (generation 2, 1 rework)
+  SUCCEEDED          policy-review  (generation 2)
+  AWAITING_APPROVAL  release-readiness
+  PENDING            promote
+
+  release-readiness is waiting for approval:
+    - Release sign-off for CHG-brownfield: 4 added, 10 modified, 0 deleted; 113/113 tests pass.
+    - High impact: CHG-001 migrations/002_link_expiry.sql: adds a database migration
+
+  Review packet: demo-output/runs/brownfield/review/README.md
+
+$ sdlc approve brownfield release-readiness --by demo-reviewer --comment 'Release approved. Rollback plan reviewed.'
+Recorded: release-readiness approved by demo-reviewer. Continue with: resume brownfield
+
+$ sdlc resume brownfield
+  ▶ promote: started (generation 1, attempt 1)
+  ✔ promote: succeeded
+
+Run brownfield: SUCCEEDED
+  SUCCEEDED          requirements
+  SUCCEEDED          impact-analysis
+  SUCCEEDED          planning
+  SUCCEEDED          architecture
+  SUCCEEDED          implementation  (generation 2)
+  SUCCEEDED          test-design  (generation 2)
+  SUCCEEDED          documentation
+  SUCCEEDED          integrate  (generation 2)
+  SUCCEEDED          build-verify  (generation 2, 1 rework)
+  SUCCEEDED          policy-review  (generation 2)
+  SUCCEEDED          release-readiness
+  SUCCEEDED          promote
+
+  Review packet: demo-output/runs/brownfield/review/README.md
+
+$ sdlc lineage brownfield test-report
+test-report v2 [c782e8d38fad] by agent:build-verifier (build-verify, generation 2)
+  workspace-state v2 [1981e3641d45] by agent:integrator (integrate, generation 2)
+    code-changes v2 [0d2a345353e1] by agent:implementation (implementation, generation 2)
+      build-feedback v1 [f7a276a9d731] by orchestrator (build-verify, generation 1)
+        workspace-state v1 [766d5ee2bc65] by agent:integrator (integrate, generation 1)
+          code-changes v1 [21697a8421fa] by agent:implementation (implementation, generation 1)
+            design v1 [8e8ba307ceea] by agent:architecture (architecture, generation 1)
+              impact-report v1 [653c7e9a2676] by agent:impact-analysis (impact-analysis, generation 1)
+                baseline-index v1 [fce56ec2be03] by orchestrator (run-creation, generation 0)
+                requirement-spec v1 [7923bb6d3661] by agent:requirements (requirements, generation 1)
+                  baseline-index v1 [fce56ec2be03] by orchestrator (run-creation, generation 0) …
+                  requirement v1 [5cfa836f8989] by requester (run-creation, generation 0)
+              plan v1 [50739c6147d7] by agent:planning (planning, generation 1)
+                impact-report v1 [653c7e9a2676] by agent:impact-analysis (impact-analysis, generation 1) …
+                requirement-spec v1 [7923bb6d3661] by agent:requirements (requirements, generation 1) …
+              requirement-spec v1 [7923bb6d3661] by agent:requirements (requirements, generation 1) …
+            impact-report v1 [653c7e9a2676] by agent:impact-analysis (impact-analysis, generation 1) …
+            plan v1 [50739c6147d7] by agent:planning (planning, generation 1) …
+            requirement-spec v1 [7923bb6d3661] by agent:requirements (requirements, generation 1) …
+          design v1 [8e8ba307ceea] by agent:architecture (architecture, generation 1) …
+          doc-changes v1 [bc39411227bc] by agent:documentation (documentation, generation 1)
+            design v1 [8e8ba307ceea] by agent:architecture (architecture, generation 1) …
+            impact-report v1 [653c7e9a2676] by agent:impact-analysis (impact-analysis, generation 1) …
+            plan v1 [50739c6147d7] by agent:planning (planning, generation 1) …
+            requirement-spec v1 [7923bb6d3661] by agent:requirements (requirements, generation 1) …
+          plan v1 [50739c6147d7] by agent:planning (planning, generation 1) …
+          test-changes v1 [fc1e36687122] by agent:test-design (test-design, generation 2, unchanged from an earlier generation)
+            build-feedback v1 [f7a276a9d731] by orchestrator (build-verify, generation 1) …
+            design v1 [8e8ba307ceea] by agent:architecture (architecture, generation 1) …
+            impact-report v1 [653c7e9a2676] by agent:impact-analysis (impact-analysis, generation 1) …
+            plan v1 [50739c6147d7] by agent:planning (planning, generation 1) …
+            requirement-spec v1 [7923bb6d3661] by agent:requirements (requirements, generation 1) …
+      design v1 [8e8ba307ceea] by agent:architecture (architecture, generation 1) …
+      impact-report v1 [653c7e9a2676] by agent:impact-analysis (impact-analysis, generation 1) …
+      plan v1 [50739c6147d7] by agent:planning (planning, generation 1) …
+      requirement-spec v1 [7923bb6d3661] by agent:requirements (requirements, generation 1) …
+    design v1 [8e8ba307ceea] by agent:architecture (architecture, generation 1) …
+    doc-changes v1 [bc39411227bc] by agent:documentation (documentation, generation 1) …
+    plan v1 [50739c6147d7] by agent:planning (planning, generation 1) …
+    test-changes v1 [fc1e36687122] by agent:test-design (test-design, generation 2, unchanged from an earlier generation) …
+
+====================================================================================================
+SCENARIO 3: AMBIGUOUS. "Better insight into who is clicking" and "safer links".
+====================================================================================================
+
+$ sdlc run --scenario scenarios/03-ambiguous --target demo-output/url-shortener --run-id ambiguous
+Run ambiguous: "Safer links, better insight" (offline mode) → demo-output/url-shortener
+  ▶ requirements: started (generation 1, attempt 1)
+  ⏸ requirements: waiting for answers: Q-1 ("who is clicking"): Does marketing need to know about individual visitors (identity, repeat visits, location), or about the audience in aggregate (what kinds of devices, where the traffic comes from)? | Q-3 ("safer"):…
+
+Run ambiguous: PAUSED
+  AWAITING_APPROVAL  requirements
+  PENDING            impact-analysis
+  PENDING            planning
+  PENDING            architecture
+  PENDING            implementation
+  PENDING            test-design
+  PENDING            documentation
+  PENDING            integrate
+  PENDING            build-verify
+  PENDING            policy-review
+  PENDING            release-readiness
+  PENDING            promote
+
+  requirements is waiting for answers:
+    - Q-1 ("who is clicking"): Does marketing need to know about individual visitors (identity, repeat visits, location), or about the audience in aggregate (what kinds of devices, where the traffic comes from)?
+    - Q-3 ("safer"): Safer against what? Links that lead visitors to malicious or internal destinations, abuse of the API to create links in bulk, or people guessing or scraping other users' links?
+    - Q-5 ("our short links"): Do new safety rules apply only to links created from now on, or also to links that already exist?
+
+  Review packet: demo-output/runs/ambiguous/review/README.md
+
+# Three questions change what would be built and what personal data would be held, so the run will not guess.
+
+$ sdlc clarify ambiguous --by demo-requester --answer 'Q-1=Aggregate only. We must not store anything that identifies a visitor: no IP addresses, no raw user agents, no visitor IDs.' --answer 'Q-3=Unsafe destinations. The concern is links that send people to malicious sites or to internal addresses. API abuse is a separate project.' --answer 'Q-5=Existing links too. If a destination is denied later, the old link must stop redirecting.'
+Recorded 3 answer(s) from demo-requester. Continue with: resume ambiguous
+
+$ sdlc resume ambiguous
+  ▶ requirements: started (generation 2, attempt 1)
+  ✔ requirements: succeeded
+  ▶ impact-analysis: started (generation 1, attempt 1)
+  ✔ impact-analysis: succeeded
+  ▶ planning: started (generation 1, attempt 1)
+  ✔ planning: succeeded
+  ▶ architecture: started (generation 1, attempt 1)
+  ⏸ architecture: waiting for approval: The design changes the database schema. | The design changes the public API (additive). | The design touches personal data.
+
+Run ambiguous: PAUSED
+  SUCCEEDED          requirements  (generation 2)
+  SUCCEEDED          impact-analysis
+  SUCCEEDED          planning
+  AWAITING_APPROVAL  architecture
+  PENDING            implementation
+  PENDING            test-design
+  PENDING            documentation
+  PENDING            integrate
+  PENDING            build-verify
+  PENDING            policy-review
+  PENDING            release-readiness
+  PENDING            promote
+
+  architecture is waiting for approval:
+    - The design changes the database schema.
+    - The design changes the public API (additive).
+    - The design touches personal data.
+
+  Review packet: demo-output/runs/ambiguous/review/README.md
+
+# At design review the reviewer asks for more. The change request goes back to the requirements stage,
+
+# and every stage whose inputs changed is re-run. The impact analysis is re-derived and comes out identical.
+
+$ sdlc request-changes ambiguous architecture --by demo-reviewer --comment 'Bots must not inflate campaign numbers: report bot and non-bot clicks separately in the stats.'
+Recorded: architecture changes_requested by demo-reviewer. Continue with: resume ambiguous
+
+$ sdlc resume ambiguous
+  ↺ requirements: invalidated, will re-run: inputs changed (change-requests)
+  ▶ requirements: started (generation 3, attempt 1)
+  ✔ requirements: succeeded
+  ↺ impact-analysis: invalidated, will re-run: inputs changed (requirement-spec)
+  ▶ impact-analysis: started (generation 2, attempt 1)
+  ✔ impact-analysis: succeeded
+  ↺ planning: invalidated, will re-run: inputs changed (requirement-spec)
+  ▶ planning: started (generation 2, attempt 1)
+  ✔ planning: succeeded
+  ▶ architecture: started (generation 2, attempt 1)
+  ⏸ architecture: waiting for approval: The design changes the database schema. | The design changes the public API (additive). | The design touches personal data.
+
+Run ambiguous: PAUSED
+  SUCCEEDED          requirements  (generation 3)
+  SUCCEEDED          impact-analysis  (generation 2)
+  SUCCEEDED          planning  (generation 2)
+  AWAITING_APPROVAL  architecture  (generation 2)
+  PENDING            implementation
+  PENDING            test-design
+  PENDING            documentation
+  PENDING            integrate
+  PENDING            build-verify
+  PENDING            policy-review
+  PENDING            release-readiness
+  PENDING            promote
+
+  architecture is waiting for approval:
+    - The design changes the database schema.
+    - The design changes the public API (additive).
+    - The design touches personal data.
+
+  Review packet: demo-output/runs/ambiguous/review/README.md
+
+$ sdlc approve ambiguous architecture --by demo-reviewer --comment 'Approved with the bot split. Privacy position confirmed: device class only.'
+Recorded: architecture approved by demo-reviewer. Continue with: resume ambiguous
+
+$ sdlc resume ambiguous
+  ▶ implementation: started (generation 1, attempt 1)
+  ▶ test-design: started (generation 1, attempt 1)
+  ▶ documentation: started (generation 1, attempt 1)
+  ✔ implementation: succeeded
+  ✔ documentation: succeeded
+  ✔ test-design: succeeded
+  ▶ integrate: started (generation 1, attempt 1)
+  ✔ integrate: succeeded
+  ▶ build-verify: started (generation 1, attempt 1)
+  ▶ policy-review: started (generation 1, attempt 1)
+  ✔ policy-review: succeeded
+  ✔ build-verify: succeeded
+  ▶ release-readiness: started (generation 1, attempt 1)
+  ⏸ release-readiness: waiting for approval: Release sign-off for CHG-ambiguous: 6 added, 13 modified, 0 deleted; 189/189 tests pass. | High impact: CHG-001 migrations/003_click_device_class.sql: adds a database migration
+
+Run ambiguous: PAUSED
+  SUCCEEDED          requirements  (generation 3)
+  SUCCEEDED          impact-analysis  (generation 2)
+  SUCCEEDED          planning  (generation 2)
+  SUCCEEDED          architecture  (generation 2)
+  SUCCEEDED          implementation
+  SUCCEEDED          test-design
+  SUCCEEDED          documentation
+  SUCCEEDED          integrate
+  SUCCEEDED          build-verify
+  SUCCEEDED          policy-review
+  AWAITING_APPROVAL  release-readiness
+  PENDING            promote
+
+  release-readiness is waiting for approval:
+    - Release sign-off for CHG-ambiguous: 6 added, 13 modified, 0 deleted; 189/189 tests pass.
+    - High impact: CHG-001 migrations/003_click_device_class.sql: adds a database migration
+
+  Review packet: demo-output/runs/ambiguous/review/README.md
+
+$ sdlc approve ambiguous release-readiness --by demo-reviewer --comment 'Release approved.'
+Recorded: release-readiness approved by demo-reviewer. Continue with: resume ambiguous
+
+$ sdlc resume ambiguous
+  ▶ promote: started (generation 1, attempt 1)
+  ✔ promote: succeeded
+
+Run ambiguous: SUCCEEDED
+  SUCCEEDED          requirements  (generation 3)
+  SUCCEEDED          impact-analysis  (generation 2)
+  SUCCEEDED          planning  (generation 2)
+  SUCCEEDED          architecture  (generation 2)
+  SUCCEEDED          implementation
+  SUCCEEDED          test-design
+  SUCCEEDED          documentation
+  SUCCEEDED          integrate
+  SUCCEEDED          build-verify
+  SUCCEEDED          policy-review
+  SUCCEEDED          release-readiness
+  SUCCEEDED          promote
+
+  Review packet: demo-output/runs/ambiguous/review/README.md
+
+====================================================================================================
+FAILURE DEMONSTRATIONS. Fallback, rework budget, rollback, safe stop, authorized retry.
+====================================================================================================
+
+# A. The planning agent fails on every call. After its retries the engine switches to the fallback agent.
+
+$ sdlc run --scenario scenarios/01-greenfield --target demo-output/failures/fallback --run-id failure-fallback --fault 'planning=error:always'
+Run failure-fallback: "URL shortener service" (offline mode) → demo-output/failures/fallback
+  ▶ requirements: started (generation 1, attempt 1)
+  ✔ requirements: succeeded
+  – impact-analysis: skipped (not enabled for this run)
+  ▶ planning: started (generation 1, attempt 1)
+  ✘ planning: attempt 1 failed, retrying: injected fault: agent unavailable
+  ▶ planning: started (generation 1, attempt 2)
+  ✘ planning: attempt 2 failed: injected fault: agent unavailable
+  ↪ planning: switching to fallback agent agent:planning:fallback
+  ▶ planning: started (generation 1, attempt 1, fallback agent)
+  ✔ planning: succeeded
+  ▶ architecture: started (generation 1, attempt 1)
+  ⏸ architecture: waiting for approval: The design changes the database schema. | The design changes the public API (additive). | The design adds or changes dependencies: fastify, zod, typescript, vitest, @types/node.
+
+Run failure-fallback: PAUSED
+  SUCCEEDED          requirements
+  SKIPPED            impact-analysis
+  SUCCEEDED          planning  (fallback)
+  AWAITING_APPROVAL  architecture
+  PENDING            implementation
+  PENDING            test-design
+  PENDING            documentation
+  PENDING            integrate
+  PENDING            build-verify
+  PENDING            policy-review
+  PENDING            release-readiness
+  PENDING            promote
+
+  architecture is waiting for approval:
+    - The design changes the database schema.
+    - The design changes the public API (additive).
+    - The design adds or changes dependencies: fastify, zod, typescript, vitest, @types/node.
+
+  Review packet: demo-output/runs/failure-fallback/review/README.md
+
+# B. No rework allowed. The build fails, there is no budget to send it back, so the run rolls back and stops.
+
+$ sdlc run --scenario scenarios/02-brownfield --target demo-output/failures/no-rework --run-id failure-no-rework --max-reworks 0
+Run failure-no-rework: "Link expiry, and clicks lost on restart" (offline mode) → demo-output/failures/no-rework
+  ▶ requirements: started (generation 1, attempt 1)
+  ✔ requirements: succeeded
+  ▶ impact-analysis: started (generation 1, attempt 1)
+  ✔ impact-analysis: succeeded
+  ▶ planning: started (generation 1, attempt 1)
+  ✔ planning: succeeded
+  ▶ architecture: started (generation 1, attempt 1)
+  ⏸ architecture: waiting for approval: The design changes the database schema. | The design changes the public API (additive).
+
+Run failure-no-rework: PAUSED
+  SUCCEEDED          requirements
+  SUCCEEDED          impact-analysis
+  SUCCEEDED          planning
+  AWAITING_APPROVAL  architecture
+  PENDING            implementation
+  PENDING            test-design
+  PENDING            documentation
+  PENDING            integrate
+  PENDING            build-verify
+  PENDING            policy-review
+  PENDING            release-readiness
+  PENDING            promote
+
+  architecture is waiting for approval:
+    - The design changes the database schema.
+    - The design changes the public API (additive).
+
+  Review packet: demo-output/runs/failure-no-rework/review/README.md
+
+$ sdlc approve failure-no-rework architecture --by demo-reviewer --comment 'Design accepted.'
+Recorded: architecture approved by demo-reviewer. Continue with: resume failure-no-rework
+
+$ sdlc resume failure-no-rework
+  ▶ implementation: started (generation 1, attempt 1)
+  ▶ test-design: started (generation 1, attempt 1)
+  ▶ documentation: started (generation 1, attempt 1)
+  ✔ implementation: succeeded
+  ✔ documentation: succeeded
+  ✔ test-design: succeeded
+  ▶ integrate: started (generation 1, attempt 1)
+  ✔ integrate: succeeded
+  ▶ build-verify: started (generation 1, attempt 1)
+  ▶ policy-review: started (generation 1, attempt 1)
+  ✔ policy-review: succeeded
+  ✘ build-verify: exit gate "build-green" failed: test failed: test/integration/expiry.api.test.ts > link expiry creating a link rejects an expiry in the past with 400: AssertionError: expected 201 to be 400 // Object.is equality | test failed: test/integration…
+  ✘ build-verify: attempt 1 failed: still failing after 0 rework loop(s): [build-green] test failed: test/integration/expiry.api.test.ts > link expiry creating a link rejects an expiry in the past with 400: AssertionError: expected 201 to be 400 // Object.is eq…
+  ✘ build-verify: FAILED
+  ⏪ rolling back: integrate
+
+Run failure-no-rework: SAFE_STOPPED. Stage "build-verify" failed: all attempts failed. Last error: still failing after 0 rework loop(s): [build-green] test failed: test/integration/expiry.api.test.ts > link expiry creating a link rejects an expiry in the past with 400: AssertionError: expected 201 to be 400 // Object.is equality | [build-green] test failed: test/integration/expiry.api.test.ts > link expiry creating a link rejects an…
+  SUCCEEDED          requirements
+  SUCCEEDED          impact-analysis
+  SUCCEEDED          planning
+  SUCCEEDED          architecture
+  SUCCEEDED          implementation
+  SUCCEEDED          test-design
+  SUCCEEDED          documentation
+  ROLLED_BACK        integrate
+  FAILED             build-verify
+  SUCCEEDED          policy-review
+  PENDING            release-readiness
+  PENDING            promote
+
+  Review packet: demo-output/runs/failure-no-rework/review/README.md
+
+# C. Promotion fails after it has copied files into the target. The target is restored from its backup.
+
+$ sdlc run --scenario scenarios/02-brownfield --target demo-output/failures/promote-fails --run-id failure-promote --fault 'promote=error-after:1'
+Run failure-promote: "Link expiry, and clicks lost on restart" (offline mode) → demo-output/failures/promote-fails
+  ▶ requirements: started (generation 1, attempt 1)
+  ✔ requirements: succeeded
+  ▶ impact-analysis: started (generation 1, attempt 1)
+  ✔ impact-analysis: succeeded
+  ▶ planning: started (generation 1, attempt 1)
+  ✔ planning: succeeded
+  ▶ architecture: started (generation 1, attempt 1)
+  ⏸ architecture: waiting for approval: The design changes the database schema. | The design changes the public API (additive).
+
+Run failure-promote: PAUSED
+  SUCCEEDED          requirements
+  SUCCEEDED          impact-analysis
+  SUCCEEDED          planning
+  AWAITING_APPROVAL  architecture
+  PENDING            implementation
+  PENDING            test-design
+  PENDING            documentation
+  PENDING            integrate
+  PENDING            build-verify
+  PENDING            policy-review
+  PENDING            release-readiness
+  PENDING            promote
+
+  architecture is waiting for approval:
+    - The design changes the database schema.
+    - The design changes the public API (additive).
+
+  Review packet: demo-output/runs/failure-promote/review/README.md
+
+$ sdlc approve failure-promote architecture --by demo-reviewer --comment 'Design accepted.'
+Recorded: architecture approved by demo-reviewer. Continue with: resume failure-promote
+
+$ sdlc resume failure-promote
+  ▶ implementation: started (generation 1, attempt 1)
+  ▶ test-design: started (generation 1, attempt 1)
+  ▶ documentation: started (generation 1, attempt 1)
+  ✔ implementation: succeeded
+  ✔ documentation: succeeded
+  ✔ test-design: succeeded
+  ▶ integrate: started (generation 1, attempt 1)
+  ✔ integrate: succeeded
+  ▶ build-verify: started (generation 1, attempt 1)
+  ▶ policy-review: started (generation 1, attempt 1)
+  ✔ policy-review: succeeded
+  ✘ build-verify: exit gate "build-green" failed: test failed: test/integration/expiry.api.test.ts > link expiry creating a link rejects an expiry in the past with 400: AssertionError: expected 201 to be 400 // Object.is equality | test failed: test/integration…
+  ↺ build-verify: sent work back upstream (loop 1 of 2)
+  ↺ implementation: invalidated, will re-run: inputs changed (build-feedback)
+  ↺ test-design: invalidated, will re-run: inputs changed (build-feedback)
+  ▶ implementation: started (generation 2, attempt 1)
+  ▶ test-design: started (generation 2, attempt 1)
+  ✔ implementation: succeeded
+  ✔ test-design: succeeded
+  ↺ integrate: invalidated, will re-run: inputs changed (code-changes)
+  ▶ integrate: started (generation 2, attempt 1)
+  ✔ integrate: succeeded
+  ↺ policy-review: invalidated, will re-run: inputs changed (workspace-state)
+  ▶ build-verify: started (generation 2, attempt 1)
+  ▶ policy-review: started (generation 2, attempt 1)
+  ✔ policy-review: succeeded
+  ✔ build-verify: succeeded
+  ▶ release-readiness: started (generation 1, attempt 1)
+  ⏸ release-readiness: waiting for approval: Release sign-off for CHG-failure-promote: 4 added, 10 modified, 0 deleted; 113/113 tests pass. | High impact: CHG-001 migrations/002_link_expiry.sql: adds a database migration
+
+Run failure-promote: PAUSED
+  SUCCEEDED          requirements
+  SUCCEEDED          impact-analysis
+  SUCCEEDED          planning
+  SUCCEEDED          architecture
+  SUCCEEDED          implementation  (generation 2)
+  SUCCEEDED          test-design  (generation 2)
+  SUCCEEDED          documentation
+  SUCCEEDED          integrate  (generation 2)
+  SUCCEEDED          build-verify  (generation 2, 1 rework)
+  SUCCEEDED          policy-review  (generation 2)
+  AWAITING_APPROVAL  release-readiness
+  PENDING            promote
+
+  release-readiness is waiting for approval:
+    - Release sign-off for CHG-failure-promote: 4 added, 10 modified, 0 deleted; 113/113 tests pass.
+    - High impact: CHG-001 migrations/002_link_expiry.sql: adds a database migration
+
+  Review packet: demo-output/runs/failure-promote/review/README.md
+
+$ sdlc approve failure-promote release-readiness --by demo-reviewer --comment 'Release approved.'
+Recorded: release-readiness approved by demo-reviewer. Continue with: resume failure-promote
+
+$ sdlc resume failure-promote
+  ▶ promote: started (generation 1, attempt 1)
+  ✘ promote: attempt 1 failed: injected fault: failure after the action was performed
+  ✘ promote: FAILED
+  ⏪ rolling back: promote, integrate
+
+Run failure-promote: SAFE_STOPPED. Stage "promote" failed: all attempts failed. Last error: injected fault: failure after the action was performed
+  SUCCEEDED          requirements
+  SUCCEEDED          impact-analysis
+  SUCCEEDED          planning
+  SUCCEEDED          architecture
+  SUCCEEDED          implementation  (generation 2)
+  SUCCEEDED          test-design  (generation 2)
+  SUCCEEDED          documentation
+  ROLLED_BACK        integrate  (generation 2)
+  SUCCEEDED          build-verify  (generation 2, 1 rework)
+  SUCCEEDED          policy-review  (generation 2)
+  SUCCEEDED          release-readiness
+  FAILED             promote
+
+  Review packet: demo-output/runs/failure-promote/review/README.md
+
+# A stopped run stays stopped. A plain resume is refused (exit code 2):
+
+$ sdlc resume failure-promote
+error: this run was stopped. Fix the cause, then authorize a retry with: resume <run> --retry --by <name>
+
+# A person authorizes the retry. The change is byte-for-byte the one already verified and approved, so only the promotion runs.
+
+$ sdlc resume failure-promote --retry --by demo-reviewer
+  ▶ integrate: started (generation 2, attempt 1)
+  ✔ integrate: succeeded
+  = build-verify: reused, inputs unchanged
+  = policy-review: reused, inputs unchanged
+  = release-readiness: reused, inputs unchanged
+  ▶ promote: started (generation 1, attempt 1)
+  ✔ promote: succeeded
+
+Run failure-promote: SUCCEEDED
+  SUCCEEDED          requirements
+  SUCCEEDED          impact-analysis
+  SUCCEEDED          planning
+  SUCCEEDED          architecture
+  SUCCEEDED          implementation  (generation 2)
+  SUCCEEDED          test-design  (generation 2)
+  SUCCEEDED          documentation
+  SUCCEEDED          integrate  (generation 2)
+  SUCCEEDED          build-verify  (generation 2, 1 rework)
+  SUCCEEDED          policy-review  (generation 2)
+  SUCCEEDED          release-readiness
+  SUCCEEDED          promote
+
+  Review packet: demo-output/runs/failure-promote/review/README.md
+
+====================================================================================================
+ACROSS ALL RUNS
+====================================================================================================
+
+$ sdlc metrics
+Runs: 6 (5 finished)
+Success rate:            80.0%
+Retry rate:              1.3% of stage executions
+Rework loops per run:    0.33
+Rollback frequency:      40.0% of finished runs
+MTTR:                    1.1 s over 4 recoveries (1 unresolved)
+End-to-end latency:      p50 2.3 s, p95 4.5 s, mean 3.2 s (active time, succeeded runs)
+Waiting on people, mean: 0.5 s
+
+  ambiguous                          succeeded     executions 17  retries 0  fallbacks 0  rework 0  invalidated 3  rollbacks 0  active 2.3 s
+  brownfield                         succeeded     executions 17  retries 0  fallbacks 0  rework 1  invalidated 4  rollbacks 0  active 4.5 s
+  failure-fallback                   in_progress   executions  5  retries 1  fallbacks 1  rework 0  invalidated 0  rollbacks 0  active 0.5 s
+  failure-no-rework                  safe_stopped  executions 10  retries 0  fallbacks 0  rework 0  invalidated 0  rollbacks 1  active 2.1 s
+  failure-promote                    succeeded     executions 19  retries 0  fallbacks 0  rework 1  invalidated 4  rollbacks 1  active 4.2 s
+  greenfield                         succeeded     executions 11  retries 0  fallbacks 0  rework 0  invalidated 0  rollbacks 0  active 1.8 s
+
+$ sdlc audit greenfield
+OK: 88 events, hash chain intact.
+
+$ sdlc audit brownfield
+OK: 117 events, hash chain intact.
+
+$ sdlc audit ambiguous
+OK: 144 events, hash chain intact.
+
+Review packets: demo-output/runs/<run>/review/README.md
+Delivered service: demo-output/url-shortener/

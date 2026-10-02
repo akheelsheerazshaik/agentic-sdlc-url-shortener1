@@ -1,0 +1,19 @@
+{
+  "summary": "README with run instructions, configuration, design notes and known limitations, and the OpenAPI contract for all six operations.",
+  "changes": [
+    {
+      "path": "README.md",
+      "action": "create",
+      "taskIds": [
+        "T-9"
+      ]
+    },
+    {
+      "path": "openapi.yaml",
+      "action": "create",
+      "taskIds": [
+        "T-9"
+      ]
+    }
+  ]
+}

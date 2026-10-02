@@ -1,0 +1,95 @@
+{
+  "approach": "Build bottom-up so each layer is testable before the next exists: configuration and storage first, then the domain rules, then the link and analytics services, and the HTTP layer last. Tests are written against the specification in parallel with the code, and the documentation is written from the design.",
+  "tasks": [
+    {
+      "id": "T-1",
+      "title": "Project skeleton and validated configuration",
+      "lane": "code",
+      "description": "Package manifest with pinned dependencies and lock file, TypeScript and test-runner configuration, and environment configuration parsed and validated at startup.",
+      "dependsOn": [],
+      "requirementIds": ["NFR-1", "NFR-4"],
+      "files": ["package.json", "package-lock.json", "tsconfig.json", "vitest.config.ts", ".gitignore", "src/config.ts"],
+      "risk": "low"
+    },
+    {
+      "id": "T-2",
+      "title": "Database access and migrations",
+      "lane": "code",
+      "description": "Open SQLite with WAL and a busy timeout, a transaction helper, a migrator that applies numbered SQL files and refuses edited ones, and the initial schema for links and click events.",
+      "dependsOn": ["T-1"],
+      "requirementIds": ["NFR-2", "FR-1", "FR-4"],
+      "files": ["src/db/database.ts", "src/db/migrator.ts", "migrations/001_init.sql"],
+      "risk": "medium"
+    },
+    {
+      "id": "T-3",
+      "title": "Domain rules: codes, aliases, destination URLs, errors",
+      "lane": "code",
+      "description": "Random base62 code generation, alias validation with reserved names, destination URL validation, and the application error type that maps to HTTP statuses.",
+      "dependsOn": ["T-1"],
+      "requirementIds": ["FR-1", "FR-8"],
+      "files": ["src/domain/errors.ts", "src/domain/shortCode.ts", "src/domain/urlPolicy.ts"],
+      "risk": "low"
+    },
+    {
+      "id": "T-4",
+      "title": "Link repository and service",
+      "lane": "code",
+      "description": "Parameterized storage of links, and a service that creates links with insert-and-retry on a code collision and looks them up.",
+      "dependsOn": ["T-2", "T-3"],
+      "requirementIds": ["FR-1", "FR-2", "FR-3", "NFR-4"],
+      "files": ["src/links/linkRepository.ts", "src/links/linkService.ts"],
+      "risk": "medium"
+    },
+    {
+      "id": "T-5",
+      "title": "Click recording and statistics",
+      "lane": "code",
+      "description": "A bounded in-memory click queue flushed in batches in one transaction with the per-link totals, and the statistics queries.",
+      "dependsOn": ["T-2"],
+      "requirementIds": ["FR-4", "FR-6", "NFR-3"],
+      "files": ["src/analytics/clickRecorder.ts", "src/analytics/statsService.ts"],
+      "risk": "medium"
+    },
+    {
+      "id": "T-6",
+      "title": "HTTP layer: routes, rate limiter, error rendering, server",
+      "lane": "code",
+      "description": "Fastify application with the API routes, the redirect, health endpoints, a per-client token bucket on the management API, problem-document error handling, and a server entry point with graceful shutdown.",
+      "dependsOn": ["T-4", "T-5"],
+      "requirementIds": ["FR-1", "FR-2", "FR-3", "FR-4", "FR-5", "FR-7", "FR-8", "NFR-3"],
+      "files": ["src/http/rateLimiter.ts", "src/http/problem.ts", "src/http/routes.ts", "src/app.ts", "src/server.ts"],
+      "risk": "medium"
+    },
+    {
+      "id": "T-7",
+      "title": "Unit tests for the domain rules and components",
+      "lane": "test",
+      "description": "Tests for code generation, alias and URL validation, the rate limiter with a controlled clock, the migrator, and the click recorder, plus the shared test helpers.",
+      "dependsOn": [],
+      "requirementIds": ["FR-1", "FR-5", "FR-6", "NFR-2"],
+      "files": ["test/helpers.ts", "test/unit/shortCode.test.ts", "test/unit/urlPolicy.test.ts", "test/unit/rateLimiter.test.ts", "test/unit/migrator.test.ts", "test/unit/clickRecorder.test.ts"],
+      "risk": "low"
+    },
+    {
+      "id": "T-8",
+      "title": "API tests for every acceptance criterion",
+      "lane": "test",
+      "description": "Tests that drive the whole application through its HTTP interface against an in-memory database: links, redirects, statistics, rate limiting, health, and failure handling.",
+      "dependsOn": [],
+      "requirementIds": ["FR-1", "FR-2", "FR-3", "FR-4", "FR-5", "FR-6", "FR-7", "FR-8"],
+      "files": ["test/helpers.ts", "test/integration/links.api.test.ts", "test/integration/stats.api.test.ts", "test/integration/reliability.test.ts"],
+      "risk": "low"
+    },
+    {
+      "id": "T-9",
+      "title": "README and OpenAPI contract",
+      "lane": "docs",
+      "description": "How to run and configure the service, its design notes and known limitations, and the OpenAPI description of every operation.",
+      "dependsOn": [],
+      "requirementIds": ["FR-1", "FR-2", "FR-3", "FR-4", "FR-7", "NFR-1"],
+      "files": ["README.md", "openapi.yaml"],
+      "risk": "low"
+    }
+  ]
+}

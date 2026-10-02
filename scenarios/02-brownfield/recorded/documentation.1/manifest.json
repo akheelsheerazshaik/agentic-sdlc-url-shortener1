@@ -1,0 +1,19 @@
+{
+  "summary": "README and OpenAPI contract updated for expiry, the 410 response and the shutdown behaviour.",
+  "changes": [
+    {
+      "path": "README.md",
+      "action": "modify",
+      "taskIds": [
+        "T-8"
+      ]
+    },
+    {
+      "path": "openapi.yaml",
+      "action": "modify",
+      "taskIds": [
+        "T-8"
+      ]
+    }
+  ]
+}

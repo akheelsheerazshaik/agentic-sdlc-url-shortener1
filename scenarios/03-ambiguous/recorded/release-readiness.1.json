@@ -1,0 +1,34 @@
+{
+  "summary": "Two additive features and one tightening of validation. The release changes behaviour in one deliberate way: destinations on internal or denied hosts are refused, on create and on redirect. The design reads the User-Agent header to derive a device class, which is why it was flagged as touching personal data; the header is not stored or logged, and a test asserts the stored columns.",
+  "residualRisks": [
+    {
+      "risk": "A public name that resolves to a private address passes the destination check.",
+      "mitigation": "Documented limitation of checking the URL text. Resolving DNS or using a reputation feed is the follow-up if this matters in practice."
+    },
+    {
+      "risk": "A wrong denylist entry blocks legitimate links immediately, including existing ones.",
+      "mitigation": "Entries are validated at startup and match hosts and subdomains only. Removing the entry and restarting restores the links, because no blocked state is stored."
+    },
+    {
+      "risk": "Bot detection is heuristic, so nonBotClicks still contains automated traffic that poses as a browser.",
+      "mitigation": "The field is named and documented for what it measures. totalClicks is unchanged, so existing reports are not affected."
+    },
+    {
+      "risk": "The migration validates every existing click_events row against the new constraint.",
+      "mitigation": "The default satisfies the constraint. Run in a maintenance window if the table is very large."
+    }
+  ],
+  "rollbackPlan": [
+    "Redeploy the previous version. It ignores device_class and runs correctly against the migrated database, because the column has a default.",
+    "Leave migration 003 in place; the previous version does not need it removed.",
+    "Links that the new version blocked redirect again under the previous version, so remove or fix those links first if they are known to be unsafe.",
+    "Clicks recorded while the previous version is live take the default device class and are reported as unknown."
+  ],
+  "postReleaseChecks": [
+    "GET /readyz returns 200 and the startup log shows 003_click_device_class.sql applied.",
+    "Creating a link to http://169.254.169.254/ returns 400.",
+    "Add a test host to DENIED_HOSTS, restart, and confirm an existing link to it returns 410 with code link_blocked.",
+    "Follow a link from a phone and from curl, and confirm the stats show one mobile and one bot click.",
+    "Inspect a row of click_events and confirm it holds a device class and no User-Agent."
+  ]
+}

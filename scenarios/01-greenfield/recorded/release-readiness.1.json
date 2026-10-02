@@ -1,0 +1,19 @@
+{
+  "summary": "First release of a new service. There is no existing data or traffic to protect, so the release risk is low; the risks that remain are properties of the design that were accepted knowingly, chiefly the unauthenticated API.",
+  "residualRisks": [
+    { "risk": "The management API is unauthenticated.", "mitigation": "Expose it only behind a trusted gateway. Per-client rate limiting bounds abuse." },
+    { "risk": "Clicks buffered at the moment the process stops are lost.", "mitigation": "Accepted as best-effort analytics for this version and documented; flushing on shutdown is the next change." },
+    { "risk": "Short links can point at malicious sites.", "mitigation": "Scheme and credential rules are enforced now; destination reputation checks are a recorded follow-up." },
+    { "risk": "Single instance only.", "mitigation": "Run one instance. The readiness probe reports database trouble." }
+  ],
+  "rollbackPlan": [
+    "Stop the service.",
+    "Remove the deployed directory; nothing existed before this release, so there is no earlier version to restore.",
+    "Delete the SQLite file at DATABASE_PATH if the data should not be kept."
+  ],
+  "postReleaseChecks": [
+    "GET /readyz returns 200.",
+    "Create a link, follow it, and confirm the click appears in its stats within the flush interval.",
+    "Send more than the burst of creation requests from one client and confirm 429 with Retry-After."
+  ]
+}

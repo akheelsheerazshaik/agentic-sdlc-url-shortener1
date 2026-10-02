@@ -1,0 +1,128 @@
+{
+  "runs": 6,
+  "finishedRuns": 5,
+  "successRate": 0.8,
+  "retryRate": 0.012658227848101266,
+  "reworkLoopsPerRun": 0.3333333333333333,
+  "rollbackFrequency": 0.4,
+  "mttrMs": 1149.25,
+  "recoveries": 4,
+  "unresolvedFailures": 1,
+  "latencyMs": {
+    "p50": 2254,
+    "p95": 4450,
+    "mean": 3182.5
+  },
+  "meanWaitingOnHumansMs": 538.25,
+  "perRun": [
+    {
+      "runId": "ambiguous",
+      "outcome": "succeeded",
+      "stageExecutions": 17,
+      "failedAttempts": 0,
+      "retries": 0,
+      "fallbacks": 0,
+      "reworkLoops": 0,
+      "replannedStages": 3,
+      "rollbacks": 0,
+      "approvals": 4,
+      "wallClockMs": 3093,
+      "waitingOnHumansMs": 839,
+      "activeMs": 2254,
+      "recoveriesMs": [],
+      "unresolvedFailures": 0
+    },
+    {
+      "runId": "brownfield",
+      "outcome": "succeeded",
+      "stageExecutions": 17,
+      "failedAttempts": 0,
+      "retries": 0,
+      "fallbacks": 0,
+      "reworkLoops": 1,
+      "replannedStages": 4,
+      "rollbacks": 0,
+      "approvals": 2,
+      "wallClockMs": 4818,
+      "waitingOnHumansMs": 368,
+      "activeMs": 4450,
+      "recoveriesMs": [
+        1974
+      ],
+      "unresolvedFailures": 0
+    },
+    {
+      "runId": "failure-fallback",
+      "outcome": "in_progress",
+      "stageExecutions": 5,
+      "failedAttempts": 2,
+      "retries": 1,
+      "fallbacks": 1,
+      "reworkLoops": 0,
+      "replannedStages": 0,
+      "rollbacks": 0,
+      "approvals": 0,
+      "wallClockMs": 534,
+      "waitingOnHumansMs": 0,
+      "activeMs": 534,
+      "recoveriesMs": [
+        516
+      ],
+      "unresolvedFailures": 0
+    },
+    {
+      "runId": "failure-no-rework",
+      "outcome": "safe_stopped",
+      "stageExecutions": 10,
+      "failedAttempts": 1,
+      "retries": 0,
+      "fallbacks": 0,
+      "reworkLoops": 0,
+      "replannedStages": 0,
+      "rollbacks": 1,
+      "approvals": 1,
+      "wallClockMs": 2327,
+      "waitingOnHumansMs": 178,
+      "activeMs": 2149,
+      "recoveriesMs": [],
+      "unresolvedFailures": 1
+    },
+    {
+      "runId": "failure-promote",
+      "outcome": "succeeded",
+      "stageExecutions": 19,
+      "failedAttempts": 1,
+      "retries": 0,
+      "fallbacks": 0,
+      "reworkLoops": 1,
+      "replannedStages": 4,
+      "rollbacks": 1,
+      "approvals": 2,
+      "wallClockMs": 4763,
+      "waitingOnHumansMs": 571,
+      "activeMs": 4192,
+      "recoveriesMs": [
+        2078,
+        29
+      ],
+      "unresolvedFailures": 0
+    },
+    {
+      "runId": "greenfield",
+      "outcome": "succeeded",
+      "stageExecutions": 11,
+      "failedAttempts": 0,
+      "retries": 0,
+      "fallbacks": 0,
+      "reworkLoops": 0,
+      "replannedStages": 0,
+      "rollbacks": 0,
+      "approvals": 2,
+      "wallClockMs": 2209,
+      "waitingOnHumansMs": 375,
+      "activeMs": 1834,
+      "recoveriesMs": [],
+      "unresolvedFailures": 0
+    }
+  ]
+}

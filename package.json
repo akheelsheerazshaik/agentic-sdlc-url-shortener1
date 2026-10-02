@@ -1,0 +1,18 @@
+{
+  "name": "agentic-sdlc-url-shortener",
+  "version": "1.0.0",
+  "description": "An agentic SDLC orchestrator and the URL shortener service it delivers",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.18"
+  },
+  "scripts": {
+    "setup": "npm --prefix orchestrator ci && npm --prefix url-shortener ci",
+    "test": "npm --prefix orchestrator run verify && npm --prefix url-shortener run verify",
+    "test:e2e": "npm --prefix orchestrator run test:e2e",
+    "demo": "node scripts/demo.ts",
+    "sdlc": "node orchestrator/src/cli.ts",
+    "evidence": "node scripts/capture-evidence.ts"
+  }
+}

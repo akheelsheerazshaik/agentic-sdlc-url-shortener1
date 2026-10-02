@@ -1,0 +1,152 @@
+{
+  "summary": "The complete first version of the service: configuration, SQLite access and migrations, domain rules, link and analytics services, and the HTTP layer.",
+  "changes": [
+    {
+      "path": ".gitignore",
+      "action": "create",
+      "taskIds": [
+        "T-1"
+      ]
+    },
+    {
+      "path": "migrations/001_init.sql",
+      "action": "create",
+      "taskIds": [
+        "T-2"
+      ]
+    },
+    {
+      "path": "package-lock.json",
+      "action": "create",
+      "taskIds": [
+        "T-1"
+      ]
+    },
+    {
+      "path": "package.json",
+      "action": "create",
+      "taskIds": [
+        "T-1"
+      ]
+    },
+    {
+      "path": "src/analytics/clickRecorder.ts",
+      "action": "create",
+      "taskIds": [
+        "T-5"
+      ]
+    },
+    {
+      "path": "src/analytics/statsService.ts",
+      "action": "create",
+      "taskIds": [
+        "T-5"
+      ]
+    },
+    {
+      "path": "src/app.ts",
+      "action": "create",
+      "taskIds": [
+        "T-6"
+      ]
+    },
+    {
+      "path": "src/config.ts",
+      "action": "create",
+      "taskIds": [
+        "T-1"
+      ]
+    },
+    {
+      "path": "src/db/database.ts",
+      "action": "create",
+      "taskIds": [
+        "T-2"
+      ]
+    },
+    {
+      "path": "src/db/migrator.ts",
+      "action": "create",
+      "taskIds": [
+        "T-2"
+      ]
+    },
+    {
+      "path": "src/domain/errors.ts",
+      "action": "create",
+      "taskIds": [
+        "T-3"
+      ]
+    },
+    {
+      "path": "src/domain/shortCode.ts",
+      "action": "create",
+      "taskIds": [
+        "T-3"
+      ]
+    },
+    {
+      "path": "src/domain/urlPolicy.ts",
+      "action": "create",
+      "taskIds": [
+        "T-3"
+      ]
+    },
+    {
+      "path": "src/http/problem.ts",
+      "action": "create",
+      "taskIds": [
+        "T-6"
+      ]
+    },
+    {
+      "path": "src/http/rateLimiter.ts",
+      "action": "create",
+      "taskIds": [
+        "T-6"
+      ]
+    },
+    {
+      "path": "src/http/routes.ts",
+      "action": "create",
+      "taskIds": [
+        "T-6"
+      ]
+    },
+    {
+      "path": "src/links/linkRepository.ts",
+      "action": "create",
+      "taskIds": [
+        "T-4"
+      ]
+    },
+    {
+      "path": "src/links/linkService.ts",
+      "action": "create",
+      "taskIds": [
+        "T-4"
+      ]
+    },
+    {
+      "path": "src/server.ts",
+      "action": "create",
+      "taskIds": [
+        "T-6"
+      ]
+    },
+    {
+      "path": "tsconfig.json",
+      "action": "create",
+      "taskIds": [
+        "T-1"
+      ]
+    },
+    {
+      "path": "vitest.config.ts",
+      "action": "create",
+      "taskIds": [
+        "T-1"
+      ]
+    }
+  ]
+}

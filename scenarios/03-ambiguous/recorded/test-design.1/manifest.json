@@ -1,0 +1,223 @@
+{
+  "summary": "Rule and API tests for destination safety, classification tests with real User-Agent strings, and statistics tests including proof that the header is not stored.",
+  "changes": [
+    {
+      "path": "test/integration/safety.api.test.ts",
+      "action": "create",
+      "taskIds": [
+        "T-7"
+      ]
+    },
+    {
+      "path": "test/integration/stats.api.test.ts",
+      "action": "modify",
+      "taskIds": [
+        "T-8"
+      ]
+    },
+    {
+      "path": "test/unit/clickRecorder.test.ts",
+      "action": "modify",
+      "taskIds": [
+        "T-8"
+      ]
+    },
+    {
+      "path": "test/unit/deviceClass.test.ts",
+      "action": "create",
+      "taskIds": [
+        "T-8"
+      ]
+    },
+    {
+      "path": "test/unit/hostRules.test.ts",
+      "action": "create",
+      "taskIds": [
+        "T-7"
+      ]
+    },
+    {
+      "path": "test/unit/urlPolicy.test.ts",
+      "action": "modify",
+      "taskIds": [
+        "T-7"
+      ]
+    }
+  ],
+  "coverage": [
+    {
+      "criterionId": "AC-1.1",
+      "tests": [
+        {
+          "file": "test/unit/hostRules.test.ts",
+          "name": "treats private 10/8 as internal"
+        },
+        {
+          "file": "test/unit/hostRules.test.ts",
+          "name": "treats decimal integer form as internal"
+        },
+        {
+          "file": "test/unit/hostRules.test.ts",
+          "name": "treats IPv4-mapped IPv6 as internal"
+        },
+        {
+          "file": "test/integration/safety.api.test.ts",
+          "name": "rejects the cloud metadata address with 400"
+        }
+      ]
+    },
+    {
+      "criterionId": "AC-1.2",
+      "tests": [
+        {
+          "file": "test/unit/hostRules.test.ts",
+          "name": "treats localhost as internal"
+        },
+        {
+          "file": "test/integration/safety.api.test.ts",
+          "name": "rejects an internal host name with 400"
+        },
+        {
+          "file": "test/integration/safety.api.test.ts",
+          "name": "rejects a single-label host name with 400"
+        }
+      ]
+    },
+    {
+      "criterionId": "AC-1.3",
+      "tests": [
+        {
+          "file": "test/integration/safety.api.test.ts",
+          "name": "accepts public destinations that are not denied"
+        },
+        {
+          "file": "test/unit/hostRules.test.ts",
+          "name": "treats a public name as public"
+        }
+      ]
+    },
+    {
+      "criterionId": "AC-2.1",
+      "tests": [
+        {
+          "file": "test/integration/safety.api.test.ts",
+          "name": "rejects a denied host with 400"
+        },
+        {
+          "file": "test/integration/safety.api.test.ts",
+          "name": "rejects a subdomain of a denied host with 400"
+        },
+        {
+          "file": "test/unit/hostRules.test.ts",
+          "name": "does not match hosts that only share a suffix of characters"
+        }
+      ]
+    },
+    {
+      "criterionId": "AC-2.2",
+      "tests": [
+        {
+          "file": "test/integration/safety.api.test.ts",
+          "name": "refuses to start with a malformed denylist"
+        }
+      ]
+    },
+    {
+      "criterionId": "AC-3.1",
+      "tests": [
+        {
+          "file": "test/integration/safety.api.test.ts",
+          "name": "blocks an existing link once its host is added to the denylist"
+        }
+      ]
+    },
+    {
+      "criterionId": "AC-3.2",
+      "tests": [
+        {
+          "file": "test/integration/safety.api.test.ts",
+          "name": "does not record a click or reveal the destination for a blocked link"
+        }
+      ]
+    },
+    {
+      "criterionId": "AC-3.3",
+      "tests": [
+        {
+          "file": "test/integration/safety.api.test.ts",
+          "name": "blocks a stored link that points at an internal address"
+        }
+      ]
+    },
+    {
+      "criterionId": "AC-4.1",
+      "tests": [
+        {
+          "file": "test/unit/deviceClass.test.ts",
+          "name": "classifies iPhone"
+        },
+        {
+          "file": "test/unit/deviceClass.test.ts",
+          "name": "classifies Android tablet"
+        },
+        {
+          "file": "test/unit/deviceClass.test.ts",
+          "name": "classifies a missing header as unknown"
+        }
+      ]
+    },
+    {
+      "criterionId": "AC-4.2",
+      "tests": [
+        {
+          "file": "test/integration/stats.api.test.ts",
+          "name": "counts clicks per device class"
+        }
+      ]
+    },
+    {
+      "criterionId": "AC-4.3",
+      "tests": [
+        {
+          "file": "test/integration/stats.api.test.ts",
+          "name": "stores the device class but never the User-Agent header"
+        }
+      ]
+    },
+    {
+      "criterionId": "AC-4.4",
+      "tests": [
+        {
+          "file": "test/integration/stats.api.test.ts",
+          "name": "reports clicks recorded before the device column existed as unknown"
+        }
+      ]
+    },
+    {
+      "criterionId": "AC-5.1",
+      "tests": [
+        {
+          "file": "test/integration/stats.api.test.ts",
+          "name": "reports bot clicks separately and keeps totalClicks as the sum of both"
+        }
+      ]
+    },
+    {
+      "criterionId": "AC-5.2",
+      "tests": [
+        {
+          "file": "test/unit/deviceClass.test.ts",
+          "name": "classifies Googlebot"
+        },
+        {
+          "file": "test/unit/deviceClass.test.ts",
+          "name": "classifies link preview fetcher"
+        },
+        {
+          "file": "test/unit/deviceClass.test.ts",
+          "name": "classifies HTTP library"
+        }
+      ]
+    }
+  ]
+}
